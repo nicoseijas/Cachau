@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Iterator
 
-from cachau.backend import CacheEntry
+from cachau.backend import CacheEntry, EntryMetadata
 
 
 class MemoryBackend:
@@ -34,3 +34,7 @@ class MemoryBackend:
 
     def iter_entries(self) -> Iterator[tuple[str, CacheEntry]]:
         yield from list(self._entries.items())
+
+    def iter_metadata(self) -> Iterator[EntryMetadata]:
+        for key, entry in list(self._entries.items()):
+            yield EntryMetadata(key, entry.namespace, entry.size)

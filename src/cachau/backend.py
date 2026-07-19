@@ -9,7 +9,15 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Protocol
+from typing import Any, Iterator, NamedTuple, Protocol
+
+
+class EntryMetadata(NamedTuple):
+    """Lightweight per-entry facts readable without deserializing the value."""
+
+    key: str
+    namespace: str
+    size: int | None
 
 
 @dataclass(frozen=True)
@@ -36,3 +44,5 @@ class CacheBackend(Protocol):
     def clear(self, namespace: str | None = None) -> None: ...
 
     def iter_entries(self) -> Iterator[tuple[str, CacheEntry]]: ...
+
+    def iter_metadata(self) -> Iterator[EntryMetadata]: ...

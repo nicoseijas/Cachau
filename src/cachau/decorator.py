@@ -6,9 +6,9 @@ import functools
 import os
 import pathlib
 import time
-from typing import Any, Callable, TypeVar, overload
+from typing import Any, Callable, Iterable, TypeVar, overload
 
-from cachau.backend import CacheBackend, CacheEntry
+from cachau.backend import CacheBackend, CacheEntry, EntryMetadata
 from cachau.disk import DiskBackend
 from cachau.durations import parse_ttl
 from cachau.errors import ConfigurationError
@@ -17,13 +17,16 @@ from cachau.keys import digest_arguments
 from cachau.memory import MemoryBackend
 from cachau.policy import LRUBudget
 from cachau.sizes import estimate_size, parse_size
+from cachau.stats import CacheStats
 
 F = TypeVar("F", bound=Callable[..., Any])
 Clock = Callable[[], float]
 SizeOf = Callable[[Any], int]
+KeyBuilder = Callable[..., str]
 
 _default_backend = MemoryBackend()
 _DEFAULT_PERSIST_DIR = ".cachau"
+_perf_counter = time.perf_counter
 Persist = bool | str | os.PathLike
 
 
@@ -39,23 +42,95 @@ class CacheControl:
         ttl_seconds: float | None,
         max_memory_bytes: int | None,
         budget: LRUBudget | None,
+        key_builder: KeyBuilder,
+        code_change_invalidations: int = 0,
     ) -> None:
         self.namespace = namespace
         self.fingerprint = fingerprint
         self.ttl_seconds = ttl_seconds
         self.max_memory_bytes = max_memory_bytes
+        self.hits = 0
+        self.miss_not_found = 0
+        self.miss_expired = 0
+        self.miss_invalidated = 0
+        self.writes = 0
         self.evictions = 0
         self.skipped_oversized = 0
         self.size_estimate_failures = 0
         self.write_errors = 0
+        self.invalidations = 0
+        self.code_change_invalidations = code_change_invalidations
+        self.total_compute_seconds = 0.0
+        self.compute_count = 0
+        self.estimated_saved_seconds = 0.0
+        self._invalidated_keys: set[str] = set()
         self._backend = backend
         self._budget = budget
+        self._key_builder = key_builder
 
     def clear(self) -> None:
         """Forget every stored result for this function."""
         self._backend.clear(namespace=self.namespace)
         if self._budget is not None:
             self._budget.reset()
+
+    def invalidate(self, *args: Any, **kwargs: Any) -> None:
+        """Forget the stored result for one specific invocation."""
+        key = self._key_builder(*args, **kwargs)
+        try:
+            self._backend.delete(key)
+        except Exception:  # noqa: BLE001 - a failed delete never raises to callers
+            self.write_errors += 1
+        if self._budget is not None:
+            self._budget.forget(key)
+        self._invalidated_keys.add(key)
+        self.invalidations += 1
+
+    def stats(self) -> CacheStats:
+        """An immutable snapshot of this function's cache activity."""
+        entries = 0
+        current_bytes = 0
+        for row in self._iter_metadata():
+            if row.namespace == self.namespace:
+                entries += 1
+                if row.size is not None:
+                    current_bytes += row.size
+        misses = self.miss_not_found + self.miss_expired + self.miss_invalidated
+        total_calls = self.hits + misses
+        return CacheStats(
+            hits=self.hits,
+            misses=misses,
+            hit_rate=self.hits / total_calls if total_calls else 0.0,
+            miss_not_found=self.miss_not_found,
+            miss_expired=self.miss_expired,
+            miss_invalidated=self.miss_invalidated,
+            expirations=self.miss_expired,
+            writes=self.writes,
+            skipped_writes=(
+                self.skipped_oversized
+                + self.size_estimate_failures
+                + self.write_errors
+            ),
+            skipped_oversized=self.skipped_oversized,
+            size_estimate_failures=self.size_estimate_failures,
+            write_errors=self.write_errors,
+            evictions=self.evictions,
+            invalidations=self.invalidations,
+            code_change_invalidations=self.code_change_invalidations,
+            entries=entries,
+            current_bytes=current_bytes,
+            total_compute_seconds=self.total_compute_seconds,
+            estimated_saved_seconds=self.estimated_saved_seconds,
+        )
+
+    def _iter_metadata(self) -> Iterable[EntryMetadata]:
+        iter_metadata = getattr(self._backend, "iter_metadata", None)
+        if iter_metadata is not None:
+            return iter_metadata()
+        return (
+            EntryMetadata(key, entry.namespace, entry.size)
+            for key, entry in self._backend.iter_entries()
+        )
 
 
 @overload
@@ -96,38 +171,14 @@ def cache(
     budget is computed and returned but never cached. ``persist=True`` stores
     entries under ``./.cachau`` (or pass a directory) and survives process
     restarts; a failed write never loses the computed result. Exceptions are
-    never cached; unhashable arguments fail loudly.
+    never cached; unhashable arguments fail loudly. ``func.cache`` exposes
+    ``stats()``, ``clear()`` and ``invalidate(...)``.
     """
     if func is not None:
         return _wrap(func, ttl, max_memory, persist, namespace, backend, clock, size_of)
     return lambda f: _wrap(
         f, ttl, max_memory, persist, namespace, backend, clock, size_of
     )
-
-
-def _purge_stale_fingerprints(
-    store: CacheBackend, namespace: str, fingerprint: str
-) -> None:
-    """Delete this namespace's entries written under a different fingerprint.
-
-    Redefining a function (notebook cell re-run, hot reload) changes its
-    fingerprint, so the old entries can never be read again — but on a shared
-    long-lived backend they would keep consuming memory outside any budget's
-    view. Code-change invalidation therefore reclaims the storage too.
-    """
-    current_prefix = f"{namespace}:{fingerprint}:"
-    iter_metadata = getattr(store, "iter_metadata", None)
-    pairs = (
-        iter_metadata()
-        if iter_metadata is not None
-        else ((key, entry.namespace) for key, entry in store.iter_entries())
-    )
-    for key, entry_namespace in pairs:
-        if entry_namespace == namespace and not key.startswith(current_prefix):
-            try:
-                store.delete(key)
-            except Exception:  # noqa: BLE001 - best-effort cleanup at decoration
-                pass
 
 
 def _resolve_backend(
@@ -142,6 +193,38 @@ def _resolve_backend(
         directory = _DEFAULT_PERSIST_DIR if persist is True else persist
         return DiskBackend(pathlib.Path(directory))
     return backend if backend is not None else _default_backend
+
+
+def _purge_stale_fingerprints(
+    store: CacheBackend, namespace: str, fingerprint: str
+) -> int:
+    """Delete this namespace's entries written under a different fingerprint.
+
+    Redefining a function (notebook cell re-run, hot reload) changes its
+    fingerprint, so the old entries can never be read again — but on a shared
+    long-lived backend they would keep consuming memory outside any budget's
+    view. Code-change invalidation therefore reclaims the storage too.
+    Returns how many entries were invalidated.
+    """
+    current_prefix = f"{namespace}:{fingerprint}:"
+    iter_metadata = getattr(store, "iter_metadata", None)
+    rows: Iterable[EntryMetadata] = (
+        iter_metadata()
+        if iter_metadata is not None
+        else (
+            EntryMetadata(key, entry.namespace, entry.size)
+            for key, entry in store.iter_entries()
+        )
+    )
+    purged = 0
+    for row in rows:
+        if row.namespace == namespace and not row.key.startswith(current_prefix):
+            try:
+                store.delete(row.key)
+                purged += 1
+            except Exception:  # noqa: BLE001 - best-effort cleanup at decoration
+                pass
+    return purged
 
 
 def _wrap(
@@ -161,7 +244,7 @@ def _wrap(
     fingerprint = function_fingerprint(func)
     store: CacheBackend = _resolve_backend(persist, backend)
     budget = LRUBudget(max_memory_bytes) if max_memory_bytes is not None else None
-    _purge_stale_fingerprints(store, resolved_namespace, fingerprint)
+    purged = _purge_stale_fingerprints(store, resolved_namespace, fingerprint)
     last_observed = float("-inf")
 
     def now() -> float:
@@ -172,6 +255,12 @@ def _wrap(
         nonlocal last_observed
         last_observed = max(last_observed, clock())
         return last_observed
+
+    def build_key(*args: Any, **kwargs: Any) -> str:
+        return (
+            f"{resolved_namespace}:{fingerprint}:"
+            f"{digest_arguments(func, args, kwargs)}"
+        )
 
     def safe_delete(key: str) -> None:
         # A backend delete can fail on disk (locked file, permissions). The
@@ -185,20 +274,31 @@ def _wrap(
 
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        key = (
-            f"{resolved_namespace}:{fingerprint}:"
-            f"{digest_arguments(func, args, kwargs)}"
-        )
+        key = build_key(*args, **kwargs)
         entry = store.get(key)
         if entry is not None:
             if not entry.is_expired(now()):
                 if budget is not None:
                     budget.touch(key)
+                control.hits += 1
+                if control.compute_count:
+                    control.estimated_saved_seconds += (
+                        control.total_compute_seconds / control.compute_count
+                    )
                 return entry.value
             safe_delete(key)
             if budget is not None:
                 budget.forget(key)
+            control.miss_expired += 1
+        elif key in control._invalidated_keys:
+            control._invalidated_keys.discard(key)
+            control.miss_invalidated += 1
+        else:
+            control.miss_not_found += 1
+        compute_started = _perf_counter()
         value = func(*args, **kwargs)
+        control.total_compute_seconds += _perf_counter() - compute_started
+        control.compute_count += 1
         committed_at = now()  # TTL starts at commit, not at call start
         size: int | None = None
         if budget is not None:
@@ -234,6 +334,7 @@ def _wrap(
                     size=size,
                 ),
             )
+            control.writes += 1
         except Exception:
             # The cache is an optimization: a failed write (serialization,
             # disk) never loses the computed result. Release the budget slot
@@ -250,6 +351,8 @@ def _wrap(
         ttl_seconds=ttl_seconds,
         max_memory_bytes=max_memory_bytes,
         budget=budget,
+        key_builder=build_key,
+        code_change_invalidations=purged,
     )
     wrapper.cache = control  # type: ignore[attr-defined]
     return wrapper
