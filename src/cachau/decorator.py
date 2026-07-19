@@ -15,7 +15,11 @@ from cachau.disk import DiskBackend
 from cachau.durations import parse_ttl
 from cachau.errors import ConfigurationError
 from cachau.explanation import Explanation
-from cachau.fingerprint import function_fingerprint, function_namespace
+from cachau.fingerprint import (
+    function_fingerprint,
+    function_namespace,
+    is_jit_dispatcher,
+)
 from cachau.flight import KeyedLocks
 import inspect
 
@@ -77,6 +81,7 @@ class CacheControl:
         self.total_compute_seconds = 0.0
         self.compute_count = 0
         self.estimated_saved_seconds = 0.0
+        self.cold_compute_seconds = 0.0
         # Reason markers: the delete succeeded; remembering the key only
         # attributes the next miss to miss_invalidated. Bounded LRU-style.
         self._invalidation_markers: OrderedDict[str, None] = OrderedDict()
@@ -203,6 +208,7 @@ class CacheControl:
             current_bytes=current_bytes,
             total_compute_seconds=self.total_compute_seconds,
             estimated_saved_seconds=self.estimated_saved_seconds,
+            cold_compute_seconds=self.cold_compute_seconds,
         )
 
     def _iter_metadata(self) -> Iterable[EntryMetadata]:
@@ -354,6 +360,7 @@ def _wrap(
     max_memory_bytes = parse_size(max_memory)
     resolved_namespace = namespace if namespace is not None else function_namespace(func)
     fingerprint = function_fingerprint(func)
+    jit_boundary = is_jit_dispatcher(func)
     store: CacheBackend = _resolve_backend(persist, backend)
     budget = LRUBudget(max_memory_bytes) if max_memory_bytes is not None else None
     flights = KeyedLocks()
@@ -477,6 +484,12 @@ def _wrap(
         compute_elapsed = _perf_counter() - compute_started
         control.total_compute_seconds += compute_elapsed
         control.compute_count += 1
+        # A JIT dispatcher's first execution includes one-time compilation:
+        # report it as cold and keep it out of the savings baseline, so the
+        # compile cost is never counted as normal execution cost.
+        is_cold_jit = jit_boundary and control.compute_count == 1
+        if is_cold_jit:
+            control.cold_compute_seconds = compute_elapsed
         committed_at = now()  # TTL starts at commit, not at call start
         size: int | None = None
         if budget is not None:
@@ -514,8 +527,9 @@ def _wrap(
             )
             control.writes += 1
             control._pending_invalidations.discard(key)  # fresh value overwrote it
-            control._saved_basis_seconds += compute_elapsed
-            control._saved_basis_count += 1
+            if not is_cold_jit:
+                control._saved_basis_seconds += compute_elapsed
+                control._saved_basis_count += 1
         except Exception:
             # The cache is an optimization: a failed write (serialization,
             # disk) never loses the computed result. Release the budget slot
