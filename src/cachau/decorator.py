@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import functools
+import os
+import pathlib
 import time
 from typing import Any, Callable, TypeVar, overload
 
 from cachau.backend import CacheBackend, CacheEntry
+from cachau.disk import DiskBackend
 from cachau.durations import parse_ttl
+from cachau.errors import ConfigurationError
 from cachau.fingerprint import function_fingerprint, function_namespace
 from cachau.keys import digest_arguments
 from cachau.memory import MemoryBackend
@@ -19,6 +23,8 @@ Clock = Callable[[], float]
 SizeOf = Callable[[Any], int]
 
 _default_backend = MemoryBackend()
+_DEFAULT_PERSIST_DIR = ".cachau"
+Persist = bool | str | os.PathLike
 
 
 class CacheControl:
@@ -41,6 +47,7 @@ class CacheControl:
         self.evictions = 0
         self.skipped_oversized = 0
         self.size_estimate_failures = 0
+        self.write_errors = 0
         self._backend = backend
         self._budget = budget
 
@@ -60,6 +67,7 @@ def cache(
     *,
     ttl: int | float | str | None = None,
     max_memory: int | str | None = None,
+    persist: Persist | None = None,
     namespace: str | None = None,
     backend: CacheBackend | None = None,
     clock: Clock = ...,
@@ -72,6 +80,7 @@ def cache(
     *,
     ttl: int | float | str | None = None,
     max_memory: int | str | None = None,
+    persist: Persist | None = None,
     namespace: str | None = None,
     backend: CacheBackend | None = None,
     clock: Clock = time.time,
@@ -80,16 +89,20 @@ def cache(
     """Cache a function's results, keyed by its normalized arguments.
 
     Usable bare (``@cache``) or configured (``@cache(ttl="1h",
-    max_memory="2GB")``). TTL accepts seconds or readable strings and starts
-    when the result is committed. ``max_memory`` accepts bytes or size strings
-    (``"512MB"``, ``"2GB"``; binary units) and bounds this function's entries
-    with LRU eviction — an entry larger than the whole budget is computed and
-    returned but never cached. Exceptions are never cached; unhashable
-    arguments fail loudly.
+    max_memory="2GB", persist=True)``). TTL accepts seconds or readable
+    strings and starts when the result is committed. ``max_memory`` accepts
+    bytes or size strings (``"512MB"``, ``"2GB"``; binary units) and bounds
+    this function's entries with LRU eviction — an entry larger than the whole
+    budget is computed and returned but never cached. ``persist=True`` stores
+    entries under ``./.cachau`` (or pass a directory) and survives process
+    restarts; a failed write never loses the computed result. Exceptions are
+    never cached; unhashable arguments fail loudly.
     """
     if func is not None:
-        return _wrap(func, ttl, max_memory, namespace, backend, clock, size_of)
-    return lambda f: _wrap(f, ttl, max_memory, namespace, backend, clock, size_of)
+        return _wrap(func, ttl, max_memory, persist, namespace, backend, clock, size_of)
+    return lambda f: _wrap(
+        f, ttl, max_memory, persist, namespace, backend, clock, size_of
+    )
 
 
 def _purge_stale_fingerprints(
@@ -108,10 +121,25 @@ def _purge_stale_fingerprints(
             store.delete(key)
 
 
+def _resolve_backend(
+    persist: Persist | None, backend: CacheBackend | None
+) -> CacheBackend:
+    if persist:
+        if backend is not None:
+            raise ConfigurationError(
+                "persist= and backend= are mutually exclusive: persist creates "
+                "a DiskBackend; pass a custom backend without persist instead"
+            )
+        directory = _DEFAULT_PERSIST_DIR if persist is True else persist
+        return DiskBackend(pathlib.Path(directory))
+    return backend if backend is not None else _default_backend
+
+
 def _wrap(
     func: Callable[..., Any],
     ttl: int | float | str | None,
     max_memory: int | str | None,
+    persist: Persist | None,
     namespace: str | None,
     backend: CacheBackend | None,
     clock: Clock,
@@ -122,7 +150,7 @@ def _wrap(
     max_memory_bytes = parse_size(max_memory)
     resolved_namespace = namespace if namespace is not None else function_namespace(func)
     fingerprint = function_fingerprint(func)
-    store: CacheBackend = backend if backend is not None else _default_backend
+    store: CacheBackend = _resolve_backend(persist, backend)
     budget = LRUBudget(max_memory_bytes) if max_memory_bytes is not None else None
     _purge_stale_fingerprints(store, resolved_namespace, fingerprint)
     last_observed = float("-inf")
@@ -174,18 +202,26 @@ def _wrap(
             for evicted_key in budget.admit(key, size):
                 store.delete(evicted_key)
                 control.evictions += 1
-        store.set(
-            key,
-            CacheEntry(
-                value=value,
-                namespace=resolved_namespace,
-                created_at=committed_at,
-                expires_at=(
-                    committed_at + ttl_seconds if ttl_seconds is not None else None
+        try:
+            store.set(
+                key,
+                CacheEntry(
+                    value=value,
+                    namespace=resolved_namespace,
+                    created_at=committed_at,
+                    expires_at=(
+                        committed_at + ttl_seconds if ttl_seconds is not None else None
+                    ),
+                    size=size,
                 ),
-                size=size,
-            ),
-        )
+            )
+        except Exception:
+            # The cache is an optimization: a failed write (serialization,
+            # disk) never loses the computed result. Release the budget slot
+            # so a phantom entry cannot shrink future capacity.
+            control.write_errors += 1
+            if budget is not None:
+                budget.forget(key)
         return value
 
     control = CacheControl(
