@@ -33,3 +33,6 @@ class CacheStats:
     current_bytes: int
     total_compute_seconds: float
     estimated_saved_seconds: float
+    # First computation of a JIT dispatcher includes one-time compilation;
+    # it is reported separately and never folded into savings estimates.
+    cold_compute_seconds: float
