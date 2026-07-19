@@ -309,6 +309,136 @@ def test_cold_jit_is_recorded_and_excluded_from_savings():
     assert final.estimated_saved_seconds < final.cold_compute_seconds
 
 
+def test_factory_closures_never_collide():
+    """CRITICAL regression: kernels from the same factory with different
+    captured parameters must not share identity (false HIT)."""
+
+    def make_adder(n):
+        @cache
+        @njit
+        def adder(x):
+            return x + n
+
+        return adder
+
+    add_one = make_adder(1)
+    add_hundred = make_adder(100)
+    assert add_one.cache.fingerprint != add_hundred.cache.fingerprint
+    assert add_one(5.0) == 6.0
+    assert add_hundred(5.0) == 105.0  # was 6.0 before the fix
+
+
+def test_plain_python_factory_closures_never_collide():
+    def make_scaler(factor):
+        @cache
+        def scale(x):
+            return x * factor
+
+        return scale
+
+    double = make_scaler(2)
+    triple = make_scaler(3)
+    assert double(10) == 20
+    assert triple(10) == 30
+
+
+def test_locals_type_forcing_changes_identity():
+    """CRITICAL regression: locals= forces intermediate precision and changes
+    numeric results; it must be part of dispatcher identity."""
+    from numba import float32, float64
+
+    @njit(locals={"y": float32})
+    def low(x):
+        y = x / 3.0
+        return y
+
+    @njit(locals={"y": float64})
+    def high(x):
+        y = x / 3.0
+        return y
+
+    assert function_fingerprint(low) != function_fingerprint(high)
+
+
+def test_changing_locals_invalidates_persisted_results(tmp_path):
+    template = """
+from numba import njit, float32, float64
+from cachau import cache
+
+@cache(persist=PERSIST_DIR, namespace="numba.locals")
+@njit(locals={"y": PRECISION})
+def compute(x):
+    y = x / 3.0
+    return y
+"""
+
+    def define(precision):
+        scope = {"PERSIST_DIR": str(tmp_path), "PRECISION": precision}
+        exec(template, scope)
+        return scope["compute"]
+
+    from numba import float32, float64
+
+    v_low = define(float32)
+    low_result = v_low(1.0)
+    v_high = define(float64)
+    assert v_high.cache.stats().code_change_invalidations == 1
+    high_result = v_high(1.0)
+    assert high_result != low_result  # float64 precision, not the stale float32
+
+
+def test_new_specialization_compile_is_cold_not_warm():
+    """HIGH regression: a later call with a new dtype triggers a fresh
+    compile; it must be labeled cold and kept out of the savings baseline."""
+
+    @cache
+    @njit
+    def add_one(x):
+        return x + 1
+
+    add_one(5)  # cold: int64 specialization
+    first_cold = add_one.cache.stats().cold_compute_seconds
+    assert first_cold > 0.0
+
+    add_one(5.0)  # NEW float64 specialization: also cold
+    stats = add_one.cache.stats()
+    assert stats.cold_compute_seconds > first_cold  # accumulated both compiles
+
+    add_one(5.0)  # HIT — no warm baseline exists, savings must stay at zero
+    assert add_one.cache.stats().estimated_saved_seconds == 0.0
+
+    add_one(6.0)  # warm: existing float64 specialization
+    add_one(6.0)  # HIT: credited with warm time only
+    final = add_one.cache.stats()
+    assert 0.0 < final.estimated_saved_seconds < final.cold_compute_seconds
+
+
+def test_njit_on_top_of_cache_fails_at_numba_not_silently():
+    """Documented ordering: @cache goes BELOW @njit. The reverse tries to
+    compile cachau's wrapper in nopython mode and fails loudly at Numba."""
+
+    @njit
+    @cache
+    def wrong_order(x):
+        return x + 1
+
+    with pytest.raises(Exception):  # numba typing/bytecode error, never a value
+        wrong_order(1.0)
+
+
+def test_vectorize_dispatchers_are_rejected_clearly():
+    from numba import vectorize
+
+    from cachau.errors import ConfigurationError
+
+    @vectorize(["float64(float64)"])
+    def as_ufunc(x):
+        return x * 2.0
+
+    with pytest.raises(ConfigurationError):
+        cache(as_ufunc)
+
+
 def test_plain_python_functions_report_no_cold_jit():
     @cache
     def plain(x):

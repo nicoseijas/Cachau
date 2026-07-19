@@ -49,15 +49,15 @@ Goal: the four-keyword experience, correct and observable.
 - [x] Full `stats()`: hits (incl. coalesced), misses, hit rate, writes, skipped writes, expirations, invalidations, evictions, serde/delete errors, entry count, bytes, compute time, estimated time saved
 - [x] `func.cache.explain(...)` — HIT/MISS with reason, size, remaining TTL; strictly pure observation (changed-dependency answers arrive with `depends_on`)
 
-**Numba Level A (first-class)** → next milestone: the design is specified, the validating test matrix is not written yet
+**Numba Level A (first-class)** ✅ validated
 
-- [ ] `@njit` functions called from Python (cache at the dispatcher boundary)
-- [ ] ndarray inputs/results, scalars
-- [ ] Dispatcher identity from Python function + semantically relevant compile options (`fastmath`, `parallel`, `boundscheck`, `error_model`)
-- [ ] Coexistence with Numba `cache=True` (compilation cache ⊥ result cache)
-- [ ] `parallel=True` and `fastmath` supported; `fastmath` change invalidates when relevant
-- [ ] Persistence, TTL, memory limits, metrics, invalidation all working for Numba workloads
-- [ ] Cold/warm JIT distinction in metrics and benchmarks
+- [x] `@njit` functions called from Python (cache at the dispatcher boundary; `@cache` goes below `@njit`)
+- [x] ndarray inputs/results, scalars
+- [x] Dispatcher identity from Python function + closure captures + semantically relevant compile options (`fastmath`, `parallel`, `boundscheck`, `error_model`, `nopython`, `forceobj`, `locals=` type forcing)
+- [x] Coexistence with Numba `cache=True` (compilation cache ⊥ result cache)
+- [x] `parallel=True` and `fastmath` supported; changing a semantic option invalidates persisted stale results
+- [x] Persistence, TTL, memory limits, metrics, invalidation all working for Numba workloads
+- [x] Cold/warm JIT distinction in metrics, per specialization (a new-dtype compile on a later call is cold, never folded into savings baselines); dedicated benchmark suite remains a V1.1 item
 
 **Stretch goal**
 

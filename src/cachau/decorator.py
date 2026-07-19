@@ -479,17 +479,30 @@ def _wrap(
                     control.miss_invalidated += 1
                 else:
                     control.miss_not_found += 1
+        specializations_before = -1
+        if jit_boundary:
+            known_signatures = getattr(func, "signatures", None)
+            if known_signatures is not None:
+                specializations_before = len(known_signatures)
         compute_started = _perf_counter()
         value = func(*args, **kwargs)
         compute_elapsed = _perf_counter() - compute_started
         control.total_compute_seconds += compute_elapsed
         control.compute_count += 1
-        # A JIT dispatcher's first execution includes one-time compilation:
-        # report it as cold and keep it out of the savings baseline, so the
-        # compile cost is never counted as normal execution cost.
-        is_cold_jit = jit_boundary and control.compute_count == 1
-        if is_cold_jit:
-            control.cold_compute_seconds = compute_elapsed
+        # Cold JIT is per SPECIALIZATION, not per function: a new dtype on a
+        # later call triggers a fresh compile. Detect it by whether the
+        # dispatcher grew a compiled signature during this execution, and
+        # keep that one-time cost out of the savings baseline so compile
+        # time is never counted as normal execution cost.
+        is_cold_jit = False
+        if jit_boundary:
+            known_signatures = getattr(func, "signatures", None)
+            if known_signatures is not None and specializations_before >= 0:
+                is_cold_jit = len(known_signatures) > specializations_before
+            else:
+                is_cold_jit = control.compute_count == 1
+            if is_cold_jit:
+                control.cold_compute_seconds += compute_elapsed
         committed_at = now()  # TTL starts at commit, not at call start
         size: int | None = None
         if budget is not None:
