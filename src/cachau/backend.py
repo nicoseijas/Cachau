@@ -20,6 +20,7 @@ class CacheEntry:
     namespace: str
     created_at: float = field(default_factory=time.time)
     expires_at: float | None = None
+    size: int | None = None
 
     def is_expired(self, now: float) -> bool:
         return self.expires_at is not None and now >= self.expires_at
