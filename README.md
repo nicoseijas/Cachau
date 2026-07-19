@@ -14,7 +14,15 @@ def expensive_analysis(df, config):
     ...
 ```
 
-> **Status: design phase.** The API and semantics are specified; implementation is underway. Star/watch the repo to follow along, or [jump into the design docs](#documentation) — this is the best moment to influence the direction.
+> **Status: v0.1.0 — the core engine is implemented and tested** (193 tests): normalized keys with type-tagged hashing, `key=`/`ignore=` escape hatches, code-change invalidation, TTL, LRU memory bounds, atomic corruption-safe persistence, same-key single-flight, `stats()` with miss reasons, and `explain()`. Pre-1.0, so the API may still evolve. Next up: validated first-class Numba support, `depends_on=` dependency invalidation, and `profile()` (see [ROADMAP](ROADMAP.md)).
+
+## Installation
+
+Not on PyPI yet — install from source:
+
+```
+pip install git+https://github.com/nicoseijas/Cachau
+```
 
 ## Why not just `functools.lru_cache` / joblib / diskcache?
 
@@ -56,14 +64,16 @@ def train_embedding(dataset_hash, params):
 def expensive_simulation(seed, params):
     ...
 
-@cache(depends_on=["data/train.parquet"])
-def load_data():
-    ...
-
 @cache(ignore=["logger", "progress_callback"])
 def run(data, logger=None, progress_callback=None):
     ...
+
+@cache(key=lambda dataset, version: version)
+def process(dataset, version):
+    ...
 ```
+
+Coming in V1.1: `@cache(depends_on=["data/train.parquet"])` — invalidation when files, environment variables, or package versions change.
 
 Every cached function carries its own control surface:
 
@@ -79,13 +89,16 @@ build_features.cache.profile(df, config)
 
 ```
 MISS
-Reason:      dependency_changed
-Dependency:  data/train.parquet
-Previous:    mtime=2026-07-18 09:12:03
-Current:     mtime=2026-07-19 08:45:11
+Reason:      expired
+Namespace:   features.build_features
+Created:     2026-07-19 14:03:11 UTC
+Expired:     3m 2s ago (at 2026-07-19 15:03:11 UTC)
+Size:        1.2 MB
 ```
 
-### `profile()` — is caching even worth it?
+(V1.1 adds dependency answers: *which file changed, previous vs. current fingerprint*.)
+
+### `profile()` — is caching even worth it? *(planned — V1.1)*
 
 ```
 Cache suitability
@@ -104,7 +117,7 @@ Recommendation:  provide an explicit stable key or dataset version.
 
 Cachau doesn't just cache — it tells you when caching is a bad decision.
 
-## First-class Numba support
+## First-class Numba support *(in progress)*
 
 ```python
 from numba import njit
@@ -116,7 +129,7 @@ def simulate(values, iterations):
     ...
 ```
 
-Cachau caches **results** at the Python → dispatcher boundary; Numba's `cache=True` caches **machine code**. They compose: a Cachau HIT skips execution entirely, and a MISS still benefits from Numba's compilation cache. Identity accounts for semantically relevant compile options (`fastmath`, `parallel`, ...), and metrics honestly separate cold-JIT from warm-JIT time.
+Cachau caches **results** at the Python → dispatcher boundary; Numba's `cache=True` caches **machine code**. They compose: a Cachau HIT skips execution entirely, and a MISS still benefits from Numba's compilation cache. The design (dispatcher identity from semantically relevant compile options like `fastmath`/`parallel`, honest cold-JIT vs. warm-JIT metrics) is fully specified in [GUIDELINES.md](GUIDELINES.md); the dedicated test matrix that validates it is the next roadmap milestone — until then, treat Numba support as unverified.
 
 ## Design principles
 
@@ -140,7 +153,7 @@ Not Redis, not a distributed cache, not a workflow engine, not an artifact regis
 
 ## Contributing
 
-The project is in its design phase — feedback on the API and semantics is the most valuable contribution right now. Open an issue to discuss use cases, edge cases, or prior art. Before proposing features, read [GUIDELINES.md](GUIDELINES.md), especially the feature acceptance bar: every addition must preserve correctness, explainability, and the narrow mission.
+The core engine is young and feedback is the most valuable contribution: try it on a real workload and open an issue with what surprised you. Bug reports with a failing test are gold. Before proposing features, read [GUIDELINES.md](GUIDELINES.md), especially the feature acceptance bar: every addition must preserve correctness, explainability, and the narrow mission.
 
 ## License
 
