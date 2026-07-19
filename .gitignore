@@ -1,0 +1,25 @@
+# Internal design documents (source material, not part of the published repo)
+*.docx
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Cachau's own default cache dir (used in docs/examples)
+.cache/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
