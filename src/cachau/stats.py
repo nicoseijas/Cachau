@@ -24,6 +24,7 @@ class CacheStats:
     skipped_oversized: int
     size_estimate_failures: int
     write_errors: int
+    delete_errors: int
     evictions: int
     invalidations: int
     code_change_invalidations: int

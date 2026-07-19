@@ -191,6 +191,139 @@ def test_stats_snapshot_is_immutable():
         stats.hits = 99
 
 
+def test_failed_invalidate_never_serves_the_stale_value(monkeypatch):
+    """CRITICAL regression: invalidate + failed physical delete must not let
+    the stale entry come back as a HIT."""
+    backend = MemoryBackend()
+    calls = []
+
+    @cache(backend=backend)
+    def expensive(x):
+        calls.append(x)
+        return x * 2
+
+    expensive(1)
+
+    real_delete = backend.delete
+
+    def failing_delete(key):
+        raise OSError("file locked")
+
+    monkeypatch.setattr(backend, "delete", failing_delete)
+    expensive.cache.invalidate(1)
+    assert expensive.cache.stats().delete_errors == 1
+
+    assert expensive(1) == 2  # recomputed, never served from the stale entry
+    assert calls == [1, 1]
+    assert expensive.cache.stats().miss_invalidated == 1
+
+    monkeypatch.setattr(backend, "delete", real_delete)
+    assert expensive(1) == 2  # fresh entry now serves normally
+    assert calls == [1, 1]
+
+
+def test_pending_invalidation_survives_until_overwrite_succeeds(monkeypatch):
+    """If both the delete and the overwriting write fail, the key stays
+    quarantined: the stale value is never served on any later call."""
+    calls = []
+
+    class StubbornBackend(MemoryBackend):
+        fail = False
+
+        def delete(self, key):
+            if self.fail:
+                raise OSError("locked")
+            super().delete(key)
+
+        def set(self, key, entry):
+            if self.fail:
+                raise OSError("disk full")
+            super().set(key, entry)
+
+    backend = StubbornBackend()
+
+    @cache(backend=backend)
+    def expensive(x):
+        calls.append(x)
+        return x * 2
+
+    expensive(1)
+    backend.fail = True
+    expensive.cache.invalidate(1)
+    assert expensive(1) == 2  # recompute; write fails too
+    assert expensive(1) == 2  # still quarantined: recompute again
+    assert calls == [1, 1, 1]
+    backend.fail = False
+    assert expensive(1) == 2  # delete retry succeeds; fresh write lands
+    assert expensive(1) == 2  # now a real HIT
+    assert calls == [1, 1, 1, 1]
+
+
+def test_clear_resets_invalidation_bookkeeping():
+    @cache
+    def expensive(x):
+        return x
+
+    expensive(1)
+    expensive.cache.invalidate(1)
+    expensive.cache.clear()
+    expensive(1)
+    stats = expensive.cache.stats()
+    assert stats.miss_invalidated == 0  # the clear, not the invalidation, wins
+    assert stats.miss_not_found == 2  # initial miss + post-clear miss
+
+
+def test_invalidating_an_expired_entry_reports_invalidated():
+    """Explicit caller action wins over lazy expiry in reason attribution."""
+    clock = FakeClock()
+
+    @cache(ttl=60, clock=clock)
+    def expensive(x):
+        return x
+
+    expensive(1)
+    clock.now = 61.0  # expired but not yet reaped
+    expensive.cache.invalidate(1)
+    expensive(1)
+    stats = expensive.cache.stats()
+    assert stats.miss_invalidated == 1
+    assert stats.miss_expired == 0
+
+
+def test_savings_average_ignores_uncacheable_computes(monkeypatch):
+    import cachau.decorator as decorator_module
+
+    fake_time = {"now": 0.0}
+    monkeypatch.setattr(decorator_module, "_perf_counter", lambda: fake_time["now"])
+
+    durations = {1: 2.0, 2: 100.0}
+
+    @cache(max_memory=100, size_of=lambda v: 1000 if v == 2 else 10)
+    def expensive(x):
+        fake_time["now"] += durations[x]
+        return x
+
+    expensive(1)  # cached, 2s
+    expensive(2)  # oversized (never cacheable), 100s — must not pollute average
+    expensive(1)  # hit: credits ~2s, not ~51s
+    assert expensive.cache.stats().estimated_saved_seconds == 2.0
+
+
+def test_invalidation_marker_set_is_bounded(monkeypatch):
+    import cachau.decorator as decorator_module
+
+    monkeypatch.setattr(decorator_module, "_INVALIDATION_MARKER_CAP", 3)
+
+    @cache
+    def expensive(x):
+        return x
+
+    for i in range(10):
+        expensive.cache.invalidate(i)
+    assert len(expensive.cache._invalidation_markers) == 3
+    assert expensive.cache.stats().invalidations == 10
+
+
 def test_counters_survive_expired_and_eviction_flows():
     clock = FakeClock()
 

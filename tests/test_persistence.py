@@ -189,7 +189,7 @@ def test_delete_failure_on_expiry_never_blocks_the_call(tmp_path, monkeypatch):
 
     monkeypatch.setattr(backend, "delete", failing_delete)
     assert expensive(1) == 2  # expired + undeletable: still recomputes and returns
-    assert expensive.cache.write_errors == 1
+    assert expensive.cache.delete_errors == 1
 
 
 def test_delete_failure_on_eviction_never_loses_the_result(tmp_path, monkeypatch):
@@ -209,7 +209,7 @@ def test_delete_failure_on_eviction_never_loses_the_result(tmp_path, monkeypatch
     monkeypatch.setattr(backend, "delete", failing_delete)
     assert expensive(2) == 4  # eviction delete fails: computed value survives
     assert expensive.cache.evictions == 1
-    assert expensive.cache.write_errors == 1
+    assert expensive.cache.delete_errors == 1
 
 
 def test_stale_purge_does_not_deserialize_payloads(tmp_path):

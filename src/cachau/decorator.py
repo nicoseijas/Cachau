@@ -6,6 +6,7 @@ import functools
 import os
 import pathlib
 import time
+from collections import OrderedDict
 from typing import Any, Callable, Iterable, TypeVar, overload
 
 from cachau.backend import CacheBackend, CacheEntry, EntryMetadata
@@ -27,6 +28,9 @@ KeyBuilder = Callable[..., str]
 _default_backend = MemoryBackend()
 _DEFAULT_PERSIST_DIR = ".cachau"
 _perf_counter = time.perf_counter
+# Bounded cap for miss-reason attribution markers (label-only: dropping one
+# can mislabel a future miss as not_found, never affect correctness).
+_INVALIDATION_MARKER_CAP = 4096
 Persist = bool | str | os.PathLike
 
 
@@ -58,12 +62,23 @@ class CacheControl:
         self.skipped_oversized = 0
         self.size_estimate_failures = 0
         self.write_errors = 0
+        self.delete_errors = 0
         self.invalidations = 0
         self.code_change_invalidations = code_change_invalidations
         self.total_compute_seconds = 0.0
         self.compute_count = 0
         self.estimated_saved_seconds = 0.0
-        self._invalidated_keys: set[str] = set()
+        # Reason markers: the delete succeeded; remembering the key only
+        # attributes the next miss to miss_invalidated. Bounded LRU-style.
+        self._invalidation_markers: OrderedDict[str, None] = OrderedDict()
+        # Pending invalidations: the physical delete FAILED. Authoritative —
+        # the wrapper must never serve these keys from the backend, or an
+        # explicitly invalidated value would come back as a false HIT.
+        self._pending_invalidations: set[str] = set()
+        # Savings average uses only computations whose result was actually
+        # cached; skipped/oversized computes can never produce a future hit.
+        self._saved_basis_seconds = 0.0
+        self._saved_basis_count = 0
         self._backend = backend
         self._budget = budget
         self._key_builder = key_builder
@@ -73,6 +88,8 @@ class CacheControl:
         self._backend.clear(namespace=self.namespace)
         if self._budget is not None:
             self._budget.reset()
+        self._invalidation_markers.clear()
+        self._pending_invalidations.clear()
 
     def invalidate(self, *args: Any, **kwargs: Any) -> None:
         """Forget the stored result for one specific invocation."""
@@ -80,10 +97,15 @@ class CacheControl:
         try:
             self._backend.delete(key)
         except Exception:  # noqa: BLE001 - a failed delete never raises to callers
-            self.write_errors += 1
+            self.delete_errors += 1
+            self._pending_invalidations.add(key)
+        else:
+            self._invalidation_markers[key] = None
+            self._invalidation_markers.move_to_end(key)
+            while len(self._invalidation_markers) > _INVALIDATION_MARKER_CAP:
+                self._invalidation_markers.popitem(last=False)
         if self._budget is not None:
             self._budget.forget(key)
-        self._invalidated_keys.add(key)
         self.invalidations += 1
 
     def stats(self) -> CacheStats:
@@ -114,6 +136,7 @@ class CacheControl:
             skipped_oversized=self.skipped_oversized,
             size_estimate_failures=self.size_estimate_failures,
             write_errors=self.write_errors,
+            delete_errors=self.delete_errors,
             evictions=self.evictions,
             invalidations=self.invalidations,
             code_change_invalidations=self.code_change_invalidations,
@@ -270,34 +293,49 @@ def _wrap(
         try:
             store.delete(key)
         except Exception:
-            control.write_errors += 1
+            control.delete_errors += 1
 
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         key = build_key(*args, **kwargs)
-        entry = store.get(key)
-        if entry is not None:
-            if not entry.is_expired(now()):
-                if budget is not None:
-                    budget.touch(key)
-                control.hits += 1
-                if control.compute_count:
-                    control.estimated_saved_seconds += (
-                        control.total_compute_seconds / control.compute_count
-                    )
-                return entry.value
-            safe_delete(key)
+        if key in control._pending_invalidations:
+            # Authoritative: the caller invalidated this key but the physical
+            # delete failed. Never serve the backend's stale entry; retry the
+            # removal and recompute. The marker survives until either the
+            # delete or the overwriting set succeeds.
+            try:
+                store.delete(key)
+                control._pending_invalidations.discard(key)
+            except Exception:
+                control.delete_errors += 1
             if budget is not None:
                 budget.forget(key)
-            control.miss_expired += 1
-        elif key in control._invalidated_keys:
-            control._invalidated_keys.discard(key)
             control.miss_invalidated += 1
         else:
-            control.miss_not_found += 1
+            entry = store.get(key)
+            if entry is not None:
+                if not entry.is_expired(now()):
+                    if budget is not None:
+                        budget.touch(key)
+                    control.hits += 1
+                    if control._saved_basis_count:
+                        control.estimated_saved_seconds += (
+                            control._saved_basis_seconds / control._saved_basis_count
+                        )
+                    return entry.value
+                safe_delete(key)
+                if budget is not None:
+                    budget.forget(key)
+                control.miss_expired += 1
+            elif key in control._invalidation_markers:
+                del control._invalidation_markers[key]
+                control.miss_invalidated += 1
+            else:
+                control.miss_not_found += 1
         compute_started = _perf_counter()
         value = func(*args, **kwargs)
-        control.total_compute_seconds += _perf_counter() - compute_started
+        compute_elapsed = _perf_counter() - compute_started
+        control.total_compute_seconds += compute_elapsed
         control.compute_count += 1
         committed_at = now()  # TTL starts at commit, not at call start
         size: int | None = None
@@ -335,6 +373,9 @@ def _wrap(
                 ),
             )
             control.writes += 1
+            control._pending_invalidations.discard(key)  # fresh value overwrote it
+            control._saved_basis_seconds += compute_elapsed
+            control._saved_basis_count += 1
         except Exception:
             # The cache is an optimization: a failed write (serialization,
             # disk) never loses the computed result. Release the budget slot
