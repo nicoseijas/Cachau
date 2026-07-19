@@ -31,7 +31,7 @@ def test_accepted_values(value, expected):
 
 @pytest.mark.parametrize(
     "value",
-    ["", "100", "10XB", "GB", "-1GB", "0MB", 0, -5, True, [1024], 1.5],
+    ["", "100", "10XB", "GB", "-1GB", "0MB", 0, -5, True, [1024], 1.5, "1e400GB"],
 )
 def test_rejected_values_fail_fast(value):
     with pytest.raises(InvalidSizeError):

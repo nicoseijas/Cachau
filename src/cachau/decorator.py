@@ -40,6 +40,7 @@ class CacheControl:
         self.max_memory_bytes = max_memory_bytes
         self.evictions = 0
         self.skipped_oversized = 0
+        self.size_estimate_failures = 0
         self._backend = backend
         self._budget = budget
 
@@ -91,6 +92,22 @@ def cache(
     return lambda f: _wrap(f, ttl, max_memory, namespace, backend, clock, size_of)
 
 
+def _purge_stale_fingerprints(
+    store: CacheBackend, namespace: str, fingerprint: str
+) -> None:
+    """Delete this namespace's entries written under a different fingerprint.
+
+    Redefining a function (notebook cell re-run, hot reload) changes its
+    fingerprint, so the old entries can never be read again — but on a shared
+    long-lived backend they would keep consuming memory outside any budget's
+    view. Code-change invalidation therefore reclaims the storage too.
+    """
+    current_prefix = f"{namespace}:{fingerprint}:"
+    for key, entry in store.iter_entries():
+        if entry.namespace == namespace and not key.startswith(current_prefix):
+            store.delete(key)
+
+
 def _wrap(
     func: Callable[..., Any],
     ttl: int | float | str | None,
@@ -107,6 +124,7 @@ def _wrap(
     fingerprint = function_fingerprint(func)
     store: CacheBackend = backend if backend is not None else _default_backend
     budget = LRUBudget(max_memory_bytes) if max_memory_bytes is not None else None
+    _purge_stale_fingerprints(store, resolved_namespace, fingerprint)
     last_observed = float("-inf")
 
     def now() -> float:
@@ -137,7 +155,17 @@ def _wrap(
         committed_at = now()  # TTL starts at commit, not at call start
         size: int | None = None
         if budget is not None:
-            size = int(size_of(value))
+            # The cache is an optimization, never a correctness dependency: a
+            # failing or nonsensical size estimate must not crash a call that
+            # already computed its result — skip caching instead.
+            try:
+                size = int(size_of(value))
+            except Exception:
+                control.size_estimate_failures += 1
+                return value
+            if size < 0:
+                control.size_estimate_failures += 1
+                return value
             if not budget.fits(size):
                 # Oversized: compute, return, never cache, never flush the
                 # cache to make room for a pathological entry.

@@ -152,6 +152,63 @@ def test_string_max_memory_end_to_end():
     assert expensive.cache.evictions == 1
 
 
+def test_failing_size_estimator_never_crashes_a_successful_call():
+    calls = []
+
+    def broken_estimator(value):
+        raise RuntimeError("estimator bug")
+
+    @cache(max_memory=1000, size_of=broken_estimator)
+    def expensive(x):
+        calls.append(x)
+        return x * 2
+
+    assert expensive(1) == 2  # computed and returned despite estimator failure
+    assert expensive(1) == 2  # never cached: recomputed
+    assert calls == [1, 1]
+    assert expensive.cache.size_estimate_failures == 2
+
+
+def test_negative_size_estimate_is_rejected_not_admitted():
+    @cache(max_memory=100, size_of=lambda v: -50)
+    def expensive(x):
+        return x
+
+    assert expensive(1) == 1
+    assert expensive.cache.size_estimate_failures == 1
+    assert expensive.cache.evictions == 0
+
+
+def test_redefining_a_function_reclaims_stale_entries():
+    """Notebook workflow: a re-decorated function must not leak old-fingerprint
+    entries into a shared backend outside every budget's view."""
+    backend = MemoryBackend()
+
+    def define(factor):
+        namespace = "notebook.cell.expensive"
+        if factor == 2:
+
+            @cache(namespace=namespace, backend=backend)
+            def expensive(x):
+                return x * 2
+
+        else:
+
+            @cache(namespace=namespace, backend=backend)
+            def expensive(x):
+                return x * 3
+
+        return expensive
+
+    v1 = define(2)
+    v1(1)
+    v1(2)
+    assert len(list(backend.iter_entries())) == 2
+    v2 = define(3)  # redefinition purges the stale-fingerprint entries
+    assert len(list(backend.iter_entries())) == 0
+    assert v2(1) == 3
+
+
 def test_invalid_max_memory_fails_at_decoration_time():
     with pytest.raises(InvalidSizeError):
 

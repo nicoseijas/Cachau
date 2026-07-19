@@ -9,6 +9,10 @@ children (shared references counted once), everything else falls back to
 
 Limit units are binary: ``KB`` = 1024 B, ``MB`` = 1024², ``GB`` = 1024³,
 ``TB`` = 1024⁴.
+
+Note: the size is fixed at commit. If a caller mutates a cached mutable value
+after retrieval it can grow past its recorded size; the budget cannot detect
+that (see GUIDELINES.md §11 on mutation being outside the standard contract).
 """
 
 from __future__ import annotations
@@ -45,7 +49,7 @@ def parse_size(value: Any) -> int | None:
             )
         try:
             size = int(float(text[: -len(unit)]) * _UNIT_BYTES[unit])
-        except ValueError:
+        except (ValueError, OverflowError):
             raise InvalidSizeError(
                 f"max_memory string must be '<number><unit>', e.g. '512MB' or "
                 f"'1.5GB', got {value!r}"
