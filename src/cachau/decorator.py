@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import os
 import pathlib
+import threading
 import time
 from collections import OrderedDict
 from typing import Any, Callable, Iterable, TypeVar, overload
@@ -15,6 +16,7 @@ from cachau.durations import parse_ttl
 from cachau.errors import ConfigurationError
 from cachau.explanation import Explanation
 from cachau.fingerprint import function_fingerprint, function_namespace
+from cachau.flight import KeyedLocks
 from cachau.keys import digest_arguments
 from cachau.memory import MemoryBackend
 from cachau.policy import LRUBudget
@@ -32,6 +34,7 @@ _perf_counter = time.perf_counter
 # Bounded cap for miss-reason attribution markers (label-only: dropping one
 # can mislabel a future miss as not_found, never affect correctness).
 _INVALIDATION_MARKER_CAP = 4096
+_MARKER_MISSING = object()
 Persist = bool | str | os.PathLike
 
 
@@ -49,6 +52,7 @@ class CacheControl:
         budget: LRUBudget | None,
         key_builder: KeyBuilder,
         now: Clock,
+        flights: KeyedLocks,
         code_change_invalidations: int = 0,
     ) -> None:
         self.namespace = namespace
@@ -56,6 +60,7 @@ class CacheControl:
         self.ttl_seconds = ttl_seconds
         self.max_memory_bytes = max_memory_bytes
         self.hits = 0
+        self.coalesced_hits = 0
         self.miss_not_found = 0
         self.miss_expired = 0
         self.miss_invalidated = 0
@@ -85,6 +90,11 @@ class CacheControl:
         self._budget = budget
         self._key_builder = key_builder
         self._now = now
+        self._flights = flights
+        # Guards compound mutations of the invalidation bookkeeping, which is
+        # function-wide state reachable from concurrent flights of different
+        # keys. Never held across backend I/O or a computation.
+        self._mutation_guard = threading.Lock()
 
     def explain(self, *args: Any, **kwargs: Any) -> Explanation:
         """Explain what a call with these arguments would do, and why.
@@ -125,25 +135,34 @@ class CacheControl:
         self._backend.clear(namespace=self.namespace)
         if self._budget is not None:
             self._budget.reset()
-        self._invalidation_markers.clear()
-        self._pending_invalidations.clear()
+        with self._mutation_guard:
+            self._invalidation_markers.clear()
+            self._pending_invalidations.clear()
 
     def invalidate(self, *args: Any, **kwargs: Any) -> None:
-        """Forget the stored result for one specific invocation."""
+        """Forget the stored result for one specific invocation.
+
+        Serialized with any in-flight computation of the same key (per-key
+        lock), so it can never interleave with a commit and leave the budget
+        or bookkeeping inconsistent with the backend.
+        """
         key = self._key_builder(*args, **kwargs)
-        try:
-            self._backend.delete(key)
-        except Exception:  # noqa: BLE001 - a failed delete never raises to callers
-            self.delete_errors += 1
-            self._pending_invalidations.add(key)
-        else:
-            self._invalidation_markers[key] = None
-            self._invalidation_markers.move_to_end(key)
-            while len(self._invalidation_markers) > _INVALIDATION_MARKER_CAP:
-                self._invalidation_markers.popitem(last=False)
-        if self._budget is not None:
-            self._budget.forget(key)
-        self.invalidations += 1
+        with self._flights.holding(key):
+            try:
+                self._backend.delete(key)
+            except Exception:  # noqa: BLE001 - a failed delete never raises
+                self.delete_errors += 1
+                with self._mutation_guard:
+                    self._pending_invalidations.add(key)
+            else:
+                with self._mutation_guard:
+                    self._invalidation_markers[key] = None
+                    self._invalidation_markers.move_to_end(key)
+                    while len(self._invalidation_markers) > _INVALIDATION_MARKER_CAP:
+                        self._invalidation_markers.popitem(last=False)
+            if self._budget is not None:
+                self._budget.forget(key)
+            self.invalidations += 1
 
     def stats(self) -> CacheStats:
         """An immutable snapshot of this function's cache activity."""
@@ -158,6 +177,7 @@ class CacheControl:
         total_calls = self.hits + misses
         return CacheStats(
             hits=self.hits,
+            coalesced_hits=self.coalesced_hits,
             misses=misses,
             hit_rate=self.hits / total_calls if total_calls else 0.0,
             miss_not_found=self.miss_not_found,
@@ -304,17 +324,22 @@ def _wrap(
     fingerprint = function_fingerprint(func)
     store: CacheBackend = _resolve_backend(persist, backend)
     budget = LRUBudget(max_memory_bytes) if max_memory_bytes is not None else None
+    flights = KeyedLocks()
     purged = _purge_stale_fingerprints(store, resolved_namespace, fingerprint)
     last_observed = float("-inf")
+    clock_guard = threading.Lock()
 
     def now() -> float:
         # TTL uses wall-clock time because expires_at must survive process
         # restarts once persistence lands. Wall clocks can step backward (NTP,
         # VM resume); clamping to the last observed reading keeps time monotone
-        # for this function so an entry can never appear to grow younger.
+        # for this function so an entry can never appear to grow younger. The
+        # guard prevents concurrent flights from racing the read-modify-write
+        # and sliding the ratchet backward.
         nonlocal last_observed
-        last_observed = max(last_observed, clock())
-        return last_observed
+        with clock_guard:
+            last_observed = max(last_observed, clock())
+            return last_observed
 
     def peek_now() -> float:
         # Read-only view of the same clamped clock, for pure observers
@@ -339,9 +364,51 @@ def _wrap(
         except Exception:
             control.delete_errors += 1
 
+    _NOT_SERVED = object()
+
+    def serve_if_fresh(key: str, *, coalesced: bool) -> Any:
+        """Serve a fresh entry with hit bookkeeping, or return _NOT_SERVED.
+
+        Never classifies misses and never mutates entries — that belongs to
+        the locked flight, so the fast path and the post-lock re-check can
+        share this without double counting.
+        """
+        if key in control._pending_invalidations:
+            return _NOT_SERVED
+        entry = store.get(key)
+        if entry is None or entry.is_expired(now()):
+            return _NOT_SERVED
+        if key in control._pending_invalidations:
+            # Re-check after the read: a concurrent invalidate whose physical
+            # delete failed may have quarantined the key while we were reading
+            # the backend. Never serve a condemned entry.
+            return _NOT_SERVED
+        if budget is not None:
+            budget.touch(key)
+        control.hits += 1
+        if coalesced:
+            control.coalesced_hits += 1
+        if control._saved_basis_count:
+            control.estimated_saved_seconds += (
+                control._saved_basis_seconds / control._saved_basis_count
+            )
+        return entry.value
+
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         key = build_key(*args, **kwargs)
+        served = serve_if_fresh(key, coalesced=False)
+        if served is not _NOT_SERVED:
+            return served
+        with flights.holding(key):
+            return _compute_flight(key, args, kwargs)
+
+    def _compute_flight(key: str, args: tuple, kwargs: dict) -> Any:
+        # Re-check under the per-key lock: another flight may have committed
+        # while this caller was waiting — that is the single-flight reuse.
+        served = serve_if_fresh(key, coalesced=True)
+        if served is not _NOT_SERVED:
+            return served
         if key in control._pending_invalidations:
             # Authoritative: the caller invalidated this key but the physical
             # delete failed. Never serve the backend's stale entry; retry the
@@ -358,24 +425,20 @@ def _wrap(
         else:
             entry = store.get(key)
             if entry is not None:
-                if not entry.is_expired(now()):
-                    if budget is not None:
-                        budget.touch(key)
-                    control.hits += 1
-                    if control._saved_basis_count:
-                        control.estimated_saved_seconds += (
-                            control._saved_basis_seconds / control._saved_basis_count
-                        )
-                    return entry.value
+                # Fresh entries were served above; only expired ones reach here.
                 safe_delete(key)
                 if budget is not None:
                     budget.forget(key)
                 control.miss_expired += 1
-            elif key in control._invalidation_markers:
-                del control._invalidation_markers[key]
-                control.miss_invalidated += 1
             else:
-                control.miss_not_found += 1
+                # Atomic pop: a concurrent clear() or marker-cap eviction must
+                # not turn check-then-delete into a KeyError.
+                with control._mutation_guard:
+                    marker = control._invalidation_markers.pop(key, _MARKER_MISSING)
+                if marker is not _MARKER_MISSING:
+                    control.miss_invalidated += 1
+                else:
+                    control.miss_not_found += 1
         compute_started = _perf_counter()
         value = func(*args, **kwargs)
         compute_elapsed = _perf_counter() - compute_started
@@ -438,6 +501,7 @@ def _wrap(
         budget=budget,
         key_builder=build_key,
         now=peek_now,
+        flights=flights,
         code_change_invalidations=purged,
     )
     wrapper.cache = control  # type: ignore[attr-defined]

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class CacheStats:
     hits: int
+    coalesced_hits: int
     misses: int
     hit_rate: float
     miss_not_found: int
