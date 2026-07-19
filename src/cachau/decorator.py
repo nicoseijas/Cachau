@@ -102,7 +102,10 @@ class CacheControl:
         }
         if key in self._pending_invalidations:
             return Explanation(outcome="MISS", reason="invalidated", **common)
-        entry = self._backend.get(key)
+        # peek() is the non-destructive read (DiskBackend.get removes corrupt
+        # files as read-side maintenance; observation must not).
+        peek = getattr(self._backend, "peek", self._backend.get)
+        entry = peek(key)
         if entry is None:
             reason = (
                 "invalidated" if key in self._invalidation_markers else "not_found"
@@ -313,6 +316,13 @@ def _wrap(
         last_observed = max(last_observed, clock())
         return last_observed
 
+    def peek_now() -> float:
+        # Read-only view of the same clamped clock, for pure observers
+        # (explain, and profile later): sees what the wrapper would see
+        # without advancing the ratchet, so a transient clock spike observed
+        # only through an observation call can never poison future writes.
+        return max(last_observed, clock())
+
     def build_key(*args: Any, **kwargs: Any) -> str:
         return (
             f"{resolved_namespace}:{fingerprint}:"
@@ -427,7 +437,7 @@ def _wrap(
         max_memory_bytes=max_memory_bytes,
         budget=budget,
         key_builder=build_key,
-        now=now,
+        now=peek_now,
         code_change_invalidations=purged,
     )
     wrapper.cache = control  # type: ignore[attr-defined]

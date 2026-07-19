@@ -16,6 +16,9 @@ class MemoryBackend:
     def get(self, key: str) -> CacheEntry | None:
         return self._entries.get(key)
 
+    def peek(self, key: str) -> CacheEntry | None:
+        return self._entries.get(key)
+
     def set(self, key: str, entry: CacheEntry) -> None:
         self._entries[key] = entry
 

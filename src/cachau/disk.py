@@ -47,8 +47,15 @@ class DiskBackend:
         return self._directory / (hashlib.sha256(key.encode()).hexdigest() + _SUFFIX)
 
     def get(self, key: str) -> CacheEntry | None:
+        return self._load(key, remove_corrupt=True)
+
+    def peek(self, key: str) -> CacheEntry | None:
+        """Side-effect-free read: never removes corrupt files (observation)."""
+        return self._load(key, remove_corrupt=False)
+
+    def _load(self, key: str, *, remove_corrupt: bool) -> CacheEntry | None:
         path = self._path_for(key)
-        loaded = _read_entry(path)
+        loaded = _read_entry(path, remove_corrupt=remove_corrupt)
         if loaded is None:
             return None
         stored_key, entry = loaded

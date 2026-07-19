@@ -194,6 +194,61 @@ def test_explanation_is_immutable():
         explanation.outcome = "HIT"
 
 
+def test_explain_never_advances_the_clock_ratchet():
+    """A clock spike observed only through explain() must not poison the
+    created_at/expires_at of later real writes."""
+    clock = FakeClock(now=100.0)
+    from cachau.memory import MemoryBackend
+
+    backend = MemoryBackend()
+
+    @cache(ttl=60, clock=clock, backend=backend)
+    def expensive(x):
+        return x
+
+    expensive(1)  # committed at t=100
+    clock.now = 100_000.0  # transient spike, seen only by explain
+    expensive.cache.explain(2)
+    clock.now = 105.0  # clock corrects itself
+    expensive(2)  # real write must not inherit the spike
+    entries = {key: entry for key, entry in backend.iter_entries()}
+    created = sorted(entry.created_at for entry in entries.values())
+    assert created == [100.0, 105.0]
+
+
+def test_explain_does_not_delete_corrupt_disk_entries(tmp_path):
+    """Observation is non-destructive even for corrupt files; the next real
+    call performs the cleanup, not explain()."""
+
+    @cache(persist=str(tmp_path))
+    def expensive(x):
+        return x * 2
+
+    expensive(1)
+    (path,) = list(tmp_path.glob("*.cachau"))
+    path.write_bytes(b"garbage")
+
+    assert expensive.cache.explain(1).reason == "not_found"
+    assert path.exists()  # explain left the corrupt file alone
+    assert expensive(1) == 2  # the real call cleans up and recomputes
+    assert expensive.cache.explain(1).outcome == "HIT"
+
+
+def test_formatting_boundaries():
+    from cachau.explanation import _format_bytes, _format_duration, _format_timestamp
+
+    assert _format_bytes(0) == "0 B"
+    assert _format_bytes(1023) == "1023 B"
+    assert _format_bytes(1024) == "1.0 KB"
+    assert _format_duration(59) == "59s"
+    assert _format_duration(60) == "1m 0s"
+    assert _format_duration(3600) == "1h 0m"
+    assert _format_duration(86400) == "1d 0h"
+    assert _format_timestamp(None) == "unknown"
+    assert _format_timestamp(0.0).endswith("UTC")
+    assert _format_timestamp(-1e18) == "unknown"
+
+
 def test_str_rendering_hit():
     clock = FakeClock(now=100.0)
 

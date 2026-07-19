@@ -64,10 +64,15 @@ class Explanation:
 
 
 def _format_timestamp(timestamp: float | None) -> str:
+    # UTC with an explicit label: persisted entries travel across machines
+    # and timezones, so an unlabeled local rendering would be ambiguous.
     if timestamp is None:
         return "unknown"
-    moment = datetime.datetime.fromtimestamp(timestamp)
-    return moment.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        moment = datetime.datetime.fromtimestamp(timestamp, tz=datetime.timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return "unknown"
+    return moment.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def _format_duration(seconds: float) -> str:
