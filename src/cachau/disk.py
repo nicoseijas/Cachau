@@ -30,7 +30,7 @@ import pickle
 import uuid
 from typing import Any, Iterator
 
-from cachau.backend import CacheEntry
+from cachau.backend import CacheEntry, EntryMetadata
 
 FORMAT_VERSION = 1
 _MAGIC_PREFIX = b"cachau-entry/"
@@ -123,19 +123,22 @@ class DiskBackend:
             if loaded is not None:
                 yield loaded
 
-    def iter_metadata(self) -> Iterator[tuple[str, str]]:
-        """Yield ``(key, namespace)`` pairs without deserializing payloads.
+    def iter_metadata(self) -> Iterator[EntryMetadata]:
+        """Yield per-entry metadata without deserializing payloads.
 
-        Metadata-only decisions (stale-fingerprint purges, namespace clears)
-        must not pay for — or depend on — unpickling every stored value.
+        Metadata-only decisions (stale-fingerprint purges, namespace clears,
+        stats) must not pay for — or depend on — unpickling every stored value.
         """
         for path in sorted(self._directory.glob(f"*{_SUFFIX}")):
             metadata = _read_metadata(path)
             if metadata is not None:
                 key = metadata.get("key")
                 namespace = metadata.get("namespace")
+                size = metadata.get("size")
                 if isinstance(key, str) and isinstance(namespace, str):
-                    yield key, namespace
+                    yield EntryMetadata(
+                        key, namespace, size if isinstance(size, int) else None
+                    )
 
 
 def _split_file(content: bytes) -> tuple[dict[str, Any], bytes]:
