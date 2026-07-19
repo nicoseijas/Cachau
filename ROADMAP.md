@@ -2,54 +2,54 @@
 
 > Scope discipline is a feature. Everything beyond V1 must justify its complexity through real use cases.
 
-## Phase 0 — Foundations
+## Phase 0 — Foundations ✅ (shipped in v0.1.0)
 
 Goal: the architectural skeleton, correct before fast.
 
-- [ ] Layered architecture in place: Decorator / Public API → Invocation Normalization → Key Builder → Dependency Fingerprinting → Cache Policy → Storage Backend → Serializer → Metrics/Events
-- [ ] Minimal `CacheBackend` interface (`get`, `set`, `delete`, `clear`, `iter_entries`)
-- [ ] `MemoryBackend`
-- [ ] Key building: signature binding / argument normalization (kwargs vs. positional share a key)
-- [ ] Function identity + code fingerprint (implementation change ⇒ invalidation)
-- [ ] Namespace isolation (`package.module.function` + fingerprint; explicit `namespace=` override)
-- [ ] Native hashing for primitives, `dict`/`list`/`tuple`, dataclasses, `pathlib.Path`
-- [ ] Loud failure on unhashable arguments (never silently ignored)
-- [ ] Test harness covering the mandatory semantic tests
+- [x] Layered architecture in place: Decorator / Public API → Invocation Normalization → Key Builder → Dependency Fingerprinting → Cache Policy → Storage Backend → Serializer → Metrics/Events
+- [x] Minimal `CacheBackend` interface (`get`, `set`, `delete`, `clear`, `iter_entries`, plus `peek`/`iter_metadata` for pure observation)
+- [x] `MemoryBackend`
+- [x] Key building: signature binding / argument normalization (kwargs vs. positional share a key)
+- [x] Function identity + code fingerprint (implementation change ⇒ invalidation, including on-disk reclamation)
+- [x] Namespace isolation (`package.module.function` + fingerprint; explicit `namespace=` override)
+- [x] Native hashing for primitives, `dict`/`list`/`tuple`/`set`, dataclasses, enums, `pathlib.Path` — collision-safe (length-prefixed, type-tagged encoding)
+- [x] Loud failure on unhashable arguments (never silently ignored)
+- [x] Test harness covering the mandatory semantic tests
 
-## Phase 1 — V1: the core promise
+## Phase 1 — V1: the core promise ✅ core shipped in v0.1.0 (Numba validation pending)
 
 Goal: the four-keyword experience, correct and observable.
 
 **API surface**
 
-- [ ] `@cache` (zero-config)
-- [ ] `@cache(ttl=...)` — int seconds and `"30s"/"10m"/"2h"/"7d"` strings; lazy expiration; TTL starts at commit
-- [ ] `@cache(max_memory=...)` — LRU eviction; oversized entries computed, returned, not cached (`cache_skip_oversized`)
-- [ ] `@cache(persist=...)` — `DiskBackend` with atomic writes (temp → sync → rename), versioned format, per-entry metadata
-- [ ] `@cache(key=...)` and `@cache(ignore=[...])`
-- [ ] `func.cache.clear()`, `func.cache.invalidate(...)`, `func.cache.stats()`
-- [ ] Global `cache.clear()`, `cache.stats()`, `cache.configure(...)`
+- [x] `@cache` (zero-config)
+- [x] `@cache(ttl=...)` — int seconds and `"30s"/"10m"/"2h"/"7d"` strings; lazy expiration; TTL starts at commit; backward-clock-step clamp
+- [x] `@cache(max_memory=...)` — LRU eviction; oversized entries computed, returned, not cached (`skipped_oversized`); injectable `size_of=`
+- [x] `@cache(persist=...)` — `DiskBackend` with atomic writes (temp → sync → rename), versioned format, per-entry metadata, corruption-safe reads
+- [x] `@cache(key=...)` and `@cache(ignore=[...])`
+- [x] `func.cache.clear()`, `func.cache.invalidate(...)`, `func.cache.stats()`
+- [ ] Global `cache.clear()`, `cache.stats()`, `cache.configure(...)` → moved to V1.1 (needs a control registry)
 
 **Data-science identity**
 
-- [ ] Optimized hashing for `numpy.ndarray` (dtype + shape + content)
-- [ ] Optimized hashing for `pandas.DataFrame` / `Series`
+- [x] Optimized hashing for `numpy.ndarray` (dtype + shape + content; layout-canonicalized)
+- [x] Optimized hashing for `pandas.DataFrame` / `Series` / `Index`
 
 **Correctness & robustness**
 
-- [ ] Invalidation on code change (function fingerprint)
-- [ ] Miss reasons: `miss_not_found`, `miss_expired`, `miss_invalidated`, `miss_code_changed`, `miss_dependency_changed`, `miss_corrupt`
-- [ ] Safe fallback on corruption (degrade to miss, never mysterious errors)
-- [ ] Serialization failure ⇒ return result, record `cache_write_error`
-- [ ] Exceptions not cached
-- [ ] Same-key single-flight (per-key locking, no global lock)
+- [x] Invalidation on code change (function fingerprint, including on-disk reclamation)
+- [x] Miss reasons: `miss_not_found`, `miss_expired`, `miss_invalidated` per call; code-change invalidations reported at decoration (`miss_code_changed`/`miss_dependency_changed`/`miss_corrupt` as distinct per-call reasons arrive with `depends_on` in V1.1)
+- [x] Safe fallback on corruption (degrade to miss, never mysterious errors)
+- [x] Serialization failure ⇒ return result, record `write_errors` (delete failures tracked separately)
+- [x] Exceptions not cached
+- [x] Same-key single-flight (refcounted per-key locking, no global lock, thread-safe budget)
 
 **Observability**
 
-- [ ] Full `stats()`: hits, misses, hit rate, writes, skipped writes, expirations, invalidations, evictions, serde errors, entry count, bytes, compute time, estimated time saved
-- [ ] `func.cache.explain(...)` — HIT/MISS with reason, changed dependency, size, remaining TTL
+- [x] Full `stats()`: hits (incl. coalesced), misses, hit rate, writes, skipped writes, expirations, invalidations, evictions, serde/delete errors, entry count, bytes, compute time, estimated time saved
+- [x] `func.cache.explain(...)` — HIT/MISS with reason, size, remaining TTL; strictly pure observation (changed-dependency answers arrive with `depends_on`)
 
-**Numba Level A (first-class)**
+**Numba Level A (first-class)** → next milestone: the design is specified, the validating test matrix is not written yet
 
 - [ ] `@njit` functions called from Python (cache at the dispatcher boundary)
 - [ ] ndarray inputs/results, scalars
@@ -59,9 +59,9 @@ Goal: the four-keyword experience, correct and observable.
 - [ ] Persistence, TTL, memory limits, metrics, invalidation all working for Numba workloads
 - [ ] Cold/warm JIT distinction in metrics and benchmarks
 
-**Stretch goal (V1 if it stays small, otherwise V1.1)**
+**Stretch goal**
 
-- [ ] `func.cache.profile(...)` — cache-suitability analysis (keying vs. lookup vs. deserialize vs. warm recompute, with recommendation)
+- [ ] `func.cache.profile(...)` — moved to V1.1 (Phase 2)
 
 ## Phase 2 — V1.1: explain more, depend on data
 
