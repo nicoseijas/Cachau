@@ -66,6 +66,57 @@ def test_supported_containers_and_types():
     assert first == second
 
 
+def test_no_delimiter_injection_collisions():
+    """Boundary-shifted contents must never share a digest (false-HIT class)."""
+    collision_pairs = [
+        ((("str:", "Z"),), (("", "str:Z"),)),
+        ((["str:", "Z"],), (["", "str:Z"],)),
+        (((b"bytes:", b"Z"),), ((b"", b"bytes:Z"),)),
+        (({"Q->str:R": "S"},), ({"Q": "R->str:S"},)),
+        ((("ab", "c"),), (("a", "bc"),)),
+    ]
+    for left, right in collision_pairs:
+        assert digest_arguments(sample, (left,), {}) != digest_arguments(
+            sample, (right,), {}
+        ), f"collision between {left!r} and {right!r}"
+
+
+def test_set_and_frozenset_differ():
+    assert digest_arguments(sample, ({1, 2},), {}) != digest_arguments(
+        sample, (frozenset({1, 2}),), {}
+    )
+
+
+def test_dataclass_identity_includes_module():
+    @dataclasses.dataclass(frozen=True)
+    class Config:
+        name: str
+
+    foreign = dataclasses.make_dataclass(
+        "Config", [("name", str)], frozen=True, module="somewhere.else"
+    )
+    assert digest_arguments(sample, (Config("x"),), {}) != digest_arguments(
+        sample, (foreign("x"),), {}
+    )
+
+
+def test_enum_members_do_not_collide_with_their_values():
+    import enum
+
+    class Color(enum.IntEnum):
+        RED = 1
+
+    assert digest_arguments(sample, (Color.RED,), {}) != digest_arguments(
+        sample, (1,), {}
+    )
+
+
+def test_path_flavors_differ():
+    assert digest_arguments(sample, (pathlib.PurePosixPath("a/b"),), {}) != (
+        digest_arguments(sample, (pathlib.PureWindowsPath("a/b"),), {})
+    )
+
+
 def test_unhashable_argument_fails_loudly():
     class Opaque:
         pass

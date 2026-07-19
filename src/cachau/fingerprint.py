@@ -6,8 +6,10 @@ and constants, recursing into nested code objects so their memory addresses
 never leak into the digest. It deliberately ignores volatile details (line
 numbers, filenames) so that moving a function does not invalidate its cache.
 
-Known limitation (Phase 0): values captured by closure are not part of the
-fingerprint; treat them as arguments or dependencies if they affect results.
+Known limitation (Phase 0): the fingerprint covers only the function's own
+code object. Values captured by closure and the implementations of other
+functions it calls (globals, imports) are not included — if they affect the
+result, pass them as arguments or declare them as dependencies.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ def function_fingerprint(func: Callable[..., Any]) -> str:
     """Stable identity for *what the function does*: a digest of its code."""
     hasher = hashlib.sha256()
     _feed_code(hasher, func.__code__)
-    return hasher.hexdigest()[:16]
+    return hasher.hexdigest()
 
 
 def _feed_code(hasher: Any, code: types.CodeType) -> None:
