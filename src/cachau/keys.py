@@ -20,6 +20,7 @@ import enum
 import hashlib
 import inspect
 import pathlib
+import sys
 from typing import Any, Callable
 
 from cachau.errors import UnhashableArgumentError
@@ -99,9 +100,65 @@ def _type_identity(value: Any) -> bytes:
     return f"{cls.__module__}.{cls.__qualname__}".encode()
 
 
+def _feed_data_object(hasher: Any, value: Any) -> bool:
+    """Native hashing for NumPy/pandas objects; True when handled.
+
+    Activated only when the library is already imported (sys.modules): cachau
+    takes no hard dependency and never triggers an import. Must run before
+    the primitive branches — in NumPy 2.x ``np.float64`` subclasses ``float``
+    but reprs differently, which would silently fork semantically equal keys.
+    """
+    np = sys.modules.get("numpy")
+    if np is not None:
+        if isinstance(value, np.ndarray):
+            _emit(hasher, b"ndarray-shape", repr(value.shape).encode())
+            if value.dtype == object:
+                # Object arrays hold arbitrary Python values: hash elementwise
+                # with the standard type-tagged scheme (fails loudly on
+                # unsupported elements instead of trusting tobytes of ids).
+                _emit_count(hasher, b"ndarray-object", value.size)
+                for item in value.ravel().tolist():
+                    _feed(hasher, item)
+                return True
+            _emit(hasher, b"ndarray-dtype", str(value.dtype).encode())
+            # Canonicalize to C-order: memory layout (C/F/non-contiguous) is a
+            # compiler detail and must not fragment the cache (GUIDELINES §14).
+            _emit(hasher, b"ndarray-data", np.ascontiguousarray(value).tobytes())
+            return True
+        if isinstance(value, np.generic):
+            _feed(hasher, value.item())  # semantic value: np.int64(7) == 7
+            return True
+    pd = sys.modules.get("pandas")
+    if pd is not None:
+        if isinstance(value, pd.DataFrame):
+            _emit(hasher, b"dataframe-columns", repr(list(value.columns)).encode())
+            _emit(
+                hasher,
+                b"dataframe-dtypes",
+                repr([str(dtype) for dtype in value.dtypes]).encode(),
+            )
+            row_hashes = pd.util.hash_pandas_object(value, index=True)
+            _emit(hasher, b"dataframe-data", row_hashes.to_numpy().tobytes())
+            return True
+        if isinstance(value, pd.Series):
+            _emit(hasher, b"series-name", repr(value.name).encode())
+            _emit(hasher, b"series-dtype", str(value.dtype).encode())
+            row_hashes = pd.util.hash_pandas_object(value, index=True)
+            _emit(hasher, b"series-data", row_hashes.to_numpy().tobytes())
+            return True
+        if isinstance(value, pd.Index):
+            _emit(hasher, b"index-dtype", str(value.dtype).encode())
+            row_hashes = pd.util.hash_pandas_object(value)
+            _emit(hasher, b"index-data", row_hashes.to_numpy().tobytes())
+            return True
+    return False
+
+
 def _feed(hasher: Any, value: Any) -> None:
     if value is None:
         _emit(hasher, b"none", b"")
+    elif _feed_data_object(hasher, value):
+        pass
     elif isinstance(value, enum.Enum):
         _emit(hasher, b"enum", _type_identity(value) + b"." + value.name.encode())
     elif isinstance(value, bool):
