@@ -14,14 +14,12 @@ def expensive_analysis(df, config):
     ...
 ```
 
-> **Status: v0.1.0 — the core engine is implemented and tested** (193 tests): normalized keys with type-tagged hashing, `key=`/`ignore=` escape hatches, code-change invalidation, TTL, LRU memory bounds, atomic corruption-safe persistence, same-key single-flight, `stats()` with miss reasons, and `explain()`. Pre-1.0, so the API may still evolve. Next up: validated first-class Numba support, `depends_on=` dependency invalidation, and `profile()` (see [ROADMAP](ROADMAP.md)).
+> **Status: v0.2.0 — the core engine plus validated Numba Level A support** (236 tests): normalized keys with type-tagged hashing (incl. closure captures), native NumPy/pandas identity, `key=`/`ignore=` escape hatches, code-change invalidation, TTL, LRU memory bounds, atomic corruption-safe persistence, same-key single-flight, `stats()` with miss reasons and cold/warm JIT accounting, and `explain()`. Pre-1.0, so the API may still evolve. Next up: `depends_on=` dependency invalidation and `profile()` (see [ROADMAP](ROADMAP.md)).
 
 ## Installation
 
-Not on PyPI yet — install from source:
-
 ```
-pip install git+https://github.com/nicoseijas/Cachau
+pip install cachau
 ```
 
 ## Why not just `functools.lru_cache` / joblib / diskcache?
