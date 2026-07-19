@@ -15,6 +15,7 @@ from cachau.durations import parse_ttl
 from cachau.errors import ConfigurationError
 from cachau.explanation import Explanation
 from cachau.fingerprint import function_fingerprint, function_namespace
+from cachau.flight import KeyedLocks
 from cachau.keys import digest_arguments
 from cachau.memory import MemoryBackend
 from cachau.policy import LRUBudget
@@ -56,6 +57,7 @@ class CacheControl:
         self.ttl_seconds = ttl_seconds
         self.max_memory_bytes = max_memory_bytes
         self.hits = 0
+        self.coalesced_hits = 0
         self.miss_not_found = 0
         self.miss_expired = 0
         self.miss_invalidated = 0
@@ -158,6 +160,7 @@ class CacheControl:
         total_calls = self.hits + misses
         return CacheStats(
             hits=self.hits,
+            coalesced_hits=self.coalesced_hits,
             misses=misses,
             hit_rate=self.hits / total_calls if total_calls else 0.0,
             miss_not_found=self.miss_not_found,
@@ -304,6 +307,7 @@ def _wrap(
     fingerprint = function_fingerprint(func)
     store: CacheBackend = _resolve_backend(persist, backend)
     budget = LRUBudget(max_memory_bytes) if max_memory_bytes is not None else None
+    flights = KeyedLocks()
     purged = _purge_stale_fingerprints(store, resolved_namespace, fingerprint)
     last_observed = float("-inf")
 
@@ -339,9 +343,46 @@ def _wrap(
         except Exception:
             control.delete_errors += 1
 
+    _NOT_SERVED = object()
+
+    def serve_if_fresh(key: str, *, coalesced: bool) -> Any:
+        """Serve a fresh entry with hit bookkeeping, or return _NOT_SERVED.
+
+        Never classifies misses and never mutates entries — that belongs to
+        the locked flight, so the fast path and the post-lock re-check can
+        share this without double counting.
+        """
+        if key in control._pending_invalidations:
+            return _NOT_SERVED
+        entry = store.get(key)
+        if entry is None or entry.is_expired(now()):
+            return _NOT_SERVED
+        if budget is not None:
+            budget.touch(key)
+        control.hits += 1
+        if coalesced:
+            control.coalesced_hits += 1
+        if control._saved_basis_count:
+            control.estimated_saved_seconds += (
+                control._saved_basis_seconds / control._saved_basis_count
+            )
+        return entry.value
+
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         key = build_key(*args, **kwargs)
+        served = serve_if_fresh(key, coalesced=False)
+        if served is not _NOT_SERVED:
+            return served
+        with flights.holding(key):
+            return _compute_flight(key, args, kwargs)
+
+    def _compute_flight(key: str, args: tuple, kwargs: dict) -> Any:
+        # Re-check under the per-key lock: another flight may have committed
+        # while this caller was waiting — that is the single-flight reuse.
+        served = serve_if_fresh(key, coalesced=True)
+        if served is not _NOT_SERVED:
+            return served
         if key in control._pending_invalidations:
             # Authoritative: the caller invalidated this key but the physical
             # delete failed. Never serve the backend's stale entry; retry the
@@ -358,15 +399,7 @@ def _wrap(
         else:
             entry = store.get(key)
             if entry is not None:
-                if not entry.is_expired(now()):
-                    if budget is not None:
-                        budget.touch(key)
-                    control.hits += 1
-                    if control._saved_basis_count:
-                        control.estimated_saved_seconds += (
-                            control._saved_basis_seconds / control._saved_basis_count
-                        )
-                    return entry.value
+                # Fresh entries were served above; only expired ones reach here.
                 safe_delete(key)
                 if budget is not None:
                     budget.forget(key)
