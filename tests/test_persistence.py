@@ -165,6 +165,89 @@ def test_ttl_applies_to_persisted_entries(tmp_path):
     assert calls == [1, 1]
 
 
+def test_delete_failure_on_expiry_never_blocks_the_call(tmp_path, monkeypatch):
+    class FakeClock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    clock = FakeClock()
+    from cachau.disk import DiskBackend
+
+    backend = DiskBackend(tmp_path)
+
+    @cache(ttl=60, clock=clock, backend=backend)
+    def expensive(x):
+        return x * 2
+
+    expensive(1)
+    clock.now = 61.0
+
+    def failing_delete(key):
+        raise OSError("file locked by antivirus")
+
+    monkeypatch.setattr(backend, "delete", failing_delete)
+    assert expensive(1) == 2  # expired + undeletable: still recomputes and returns
+    assert expensive.cache.write_errors == 1
+
+
+def test_delete_failure_on_eviction_never_loses_the_result(tmp_path, monkeypatch):
+    from cachau.disk import DiskBackend
+
+    backend = DiskBackend(tmp_path)
+
+    @cache(max_memory=100, size_of=lambda v: 60, backend=backend)
+    def expensive(x):
+        return x * 2
+
+    expensive(1)
+
+    def failing_delete(key):
+        raise OSError("file locked")
+
+    monkeypatch.setattr(backend, "delete", failing_delete)
+    assert expensive(2) == 4  # eviction delete fails: computed value survives
+    assert expensive.cache.evictions == 1
+    assert expensive.cache.write_errors == 1
+
+
+def test_stale_purge_does_not_deserialize_payloads(tmp_path):
+    """Decoration-time purge is metadata-only: an unloadable payload in the
+    same namespace must neither crash decoration nor survive the purge."""
+    from cachau.backend import CacheEntry
+    from cachau.disk import DiskBackend
+
+    backend = DiskBackend(tmp_path)
+    backend.set(
+        "ver.expensive:oldfingerprint:digest",
+        CacheEntry(value=1, namespace="ver.expensive"),
+    )
+    (path,) = list(tmp_path.glob("*.cachau"))
+    content = path.read_bytes()
+    second_nl = content.index(b"\n", content.index(b"\n") + 1)
+    path.write_bytes(content[: second_nl + 1] + b"\x00 undecodable payload")
+
+    @cache(persist=str(tmp_path), namespace="ver.expensive")
+    def expensive(x):
+        return x
+
+    assert expensive(1) == 1
+    remaining = [
+        p for p in tmp_path.glob("*.cachau") if b"oldfingerprint" in p.read_bytes()
+    ]
+    assert remaining == []
+
+
+def test_clear_sweeps_stale_temp_files(tmp_path):
+    from cachau.disk import DiskBackend
+
+    backend = DiskBackend(tmp_path)
+    (tmp_path / "orphan.12345.deadbeef.tmp").write_bytes(b"partial write")
+    backend.clear()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
 def test_clear_removes_persisted_entries(tmp_path):
     @cache(persist=str(tmp_path))
     def expensive(x):

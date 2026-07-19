@@ -116,9 +116,18 @@ def _purge_stale_fingerprints(
     view. Code-change invalidation therefore reclaims the storage too.
     """
     current_prefix = f"{namespace}:{fingerprint}:"
-    for key, entry in store.iter_entries():
-        if entry.namespace == namespace and not key.startswith(current_prefix):
-            store.delete(key)
+    iter_metadata = getattr(store, "iter_metadata", None)
+    pairs = (
+        iter_metadata()
+        if iter_metadata is not None
+        else ((key, entry.namespace) for key, entry in store.iter_entries())
+    )
+    for key, entry_namespace in pairs:
+        if entry_namespace == namespace and not key.startswith(current_prefix):
+            try:
+                store.delete(key)
+            except Exception:  # noqa: BLE001 - best-effort cleanup at decoration
+                pass
 
 
 def _resolve_backend(
@@ -164,6 +173,16 @@ def _wrap(
         last_observed = max(last_observed, clock())
         return last_observed
 
+    def safe_delete(key: str) -> None:
+        # A backend delete can fail on disk (locked file, permissions). The
+        # cache is an optimization: never let that block returning a value.
+        # A lingering entry is still-correct data (a budget overrun at worst),
+        # never a false HIT.
+        try:
+            store.delete(key)
+        except Exception:
+            control.write_errors += 1
+
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         key = (
@@ -176,7 +195,7 @@ def _wrap(
                 if budget is not None:
                     budget.touch(key)
                 return entry.value
-            store.delete(key)
+            safe_delete(key)
             if budget is not None:
                 budget.forget(key)
         value = func(*args, **kwargs)
@@ -200,7 +219,7 @@ def _wrap(
                 control.skipped_oversized += 1
                 return value
             for evicted_key in budget.admit(key, size):
-                store.delete(evicted_key)
+                safe_delete(evicted_key)
                 control.evictions += 1
         try:
             store.set(

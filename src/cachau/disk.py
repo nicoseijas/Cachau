@@ -9,7 +9,11 @@ named ``sha256(key).cachau``:
 
 Writes are atomic: serialize to a temp file in the same directory, flush and
 fsync, then ``os.replace`` (atomic on POSIX and Windows). A reader never sees
-a half-written entry.
+a half-written entry. The guarantee is read-atomicity, not full crash
+durability: the rename's directory update is fsynced on POSIX (best effort)
+but a power loss immediately after commit may revert to the previous entry
+state — which is a controlled MISS, never a corrupt read. Temp files from a
+killed process are swept (best effort) on ``clear()``.
 
 Any incompatibility — unknown version, corrupt metadata, undecodable payload,
 truncation — degrades to a MISS: the file is removed (best effort) and ``get``
@@ -80,19 +84,37 @@ class DiskBackend:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp_path, final_path)
+            self._fsync_directory()
         finally:
             temp_path.unlink(missing_ok=True)
+
+    def _fsync_directory(self) -> None:
+        # POSIX: make the rename itself durable. Windows cannot fsync a
+        # directory handle this way; read-atomicity holds regardless.
+        try:
+            fd = os.open(self._directory, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
 
     def delete(self, key: str) -> None:
         self._path_for(key).unlink(missing_ok=True)
 
     def clear(self, namespace: str | None = None) -> None:
+        if namespace is None:
+            for stale_temp in self._directory.glob("*.tmp"):
+                stale_temp.unlink(missing_ok=True)
         for path in self._directory.glob(f"*{_SUFFIX}"):
             if namespace is None:
                 path.unlink(missing_ok=True)
                 continue
-            loaded = _read_entry(path, remove_corrupt=False)
-            if loaded is not None and loaded[1].namespace == namespace:
+            metadata = _read_metadata(path)
+            if metadata is not None and metadata.get("namespace") == namespace:
                 path.unlink(missing_ok=True)
 
     def iter_entries(self) -> Iterator[tuple[str, CacheEntry]]:
@@ -100,6 +122,40 @@ class DiskBackend:
             loaded = _read_entry(path, remove_corrupt=False)
             if loaded is not None:
                 yield loaded
+
+    def iter_metadata(self) -> Iterator[tuple[str, str]]:
+        """Yield ``(key, namespace)`` pairs without deserializing payloads.
+
+        Metadata-only decisions (stale-fingerprint purges, namespace clears)
+        must not pay for — or depend on — unpickling every stored value.
+        """
+        for path in sorted(self._directory.glob(f"*{_SUFFIX}")):
+            metadata = _read_metadata(path)
+            if metadata is not None:
+                key = metadata.get("key")
+                namespace = metadata.get("namespace")
+                if isinstance(key, str) and isinstance(namespace, str):
+                    yield key, namespace
+
+
+def _split_file(content: bytes) -> tuple[dict[str, Any], bytes]:
+    """Split raw file bytes into (metadata, payload); raises on any mismatch."""
+    first_nl = content.index(b"\n")
+    magic = content[:first_nl]
+    if magic != _MAGIC_PREFIX + str(FORMAT_VERSION).encode():
+        raise ValueError(f"unknown format: {magic!r}")
+    second_nl = content.index(b"\n", first_nl + 1)
+    metadata: dict[str, Any] = json.loads(content[first_nl + 1 : second_nl])
+    return metadata, content[second_nl + 1 :]
+
+
+def _read_metadata(path: pathlib.Path) -> dict[str, Any] | None:
+    """Header-only read: never deserializes the payload."""
+    try:
+        metadata, _ = _split_file(path.read_bytes())
+        return metadata
+    except Exception:  # noqa: BLE001 - any corruption degrades to a controlled miss
+        return None
 
 
 def _read_entry(
@@ -111,13 +167,8 @@ def _read_entry(
     except OSError:
         return None
     try:
-        first_nl = content.index(b"\n")
-        magic = content[:first_nl]
-        if magic != _MAGIC_PREFIX + str(FORMAT_VERSION).encode():
-            raise ValueError(f"unknown format: {magic!r}")
-        second_nl = content.index(b"\n", first_nl + 1)
-        metadata: dict[str, Any] = json.loads(content[first_nl + 1 : second_nl])
-        value = pickle.loads(content[second_nl + 1 :])
+        metadata, payload = _split_file(content)
+        value = pickle.loads(payload)
         entry = CacheEntry(
             value=value,
             namespace=metadata["namespace"],
