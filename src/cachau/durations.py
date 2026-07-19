@@ -29,12 +29,17 @@ def parse_ttl(value: Any) -> float | None:
         scale = _UNIT_SECONDS.get(unit)
         if scale is None:
             raise InvalidTTLError(
-                f"ttl string must end in one of {sorted(_UNIT_SECONDS)}, got {value!r}"
+                f"ttl string must end in a unit suffix — one of "
+                f"{sorted(_UNIT_SECONDS)} (sub-second units are not supported), "
+                f"got {value!r}"
             )
         try:
             seconds = float(value[:-1]) * scale
         except ValueError:
-            raise InvalidTTLError(f"ttl string has no numeric part: {value!r}") from None
+            raise InvalidTTLError(
+                f"ttl string must be '<number><unit>' with a plain numeric "
+                f"magnitude, e.g. '30s' or '1.5h', got {value!r}"
+            ) from None
     else:
         raise InvalidTTLError(
             f"ttl must be a number or duration string, got {type(value).__qualname__}"

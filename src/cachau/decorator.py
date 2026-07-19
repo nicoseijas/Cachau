@@ -23,6 +23,7 @@ class CacheControl:
 
     def __init__(
         self,
+        *,
         namespace: str,
         fingerprint: str,
         backend: CacheBackend,
@@ -83,6 +84,16 @@ def _wrap(
     resolved_namespace = namespace if namespace is not None else function_namespace(func)
     fingerprint = function_fingerprint(func)
     store: CacheBackend = backend if backend is not None else _default_backend
+    last_observed = float("-inf")
+
+    def now() -> float:
+        # TTL uses wall-clock time because expires_at must survive process
+        # restarts once persistence lands. Wall clocks can step backward (NTP,
+        # VM resume); clamping to the last observed reading keeps time monotone
+        # for this function so an entry can never appear to grow younger.
+        nonlocal last_observed
+        last_observed = max(last_observed, clock())
+        return last_observed
 
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -92,11 +103,11 @@ def _wrap(
         )
         entry = store.get(key)
         if entry is not None:
-            if not entry.is_expired(clock()):
+            if not entry.is_expired(now()):
                 return entry.value
             store.delete(key)
         value = func(*args, **kwargs)
-        committed_at = clock()  # TTL starts at commit, not at call start
+        committed_at = now()  # TTL starts at commit, not at call start
         store.set(
             key,
             CacheEntry(
@@ -111,6 +122,9 @@ def _wrap(
         return value
 
     wrapper.cache = CacheControl(  # type: ignore[attr-defined]
-        resolved_namespace, fingerprint, store, ttl_seconds
+        namespace=resolved_namespace,
+        fingerprint=fingerprint,
+        backend=store,
+        ttl_seconds=ttl_seconds,
     )
     return wrapper
