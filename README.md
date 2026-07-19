@@ -158,6 +158,22 @@ def simulate(values, iterations):
 
 Cachau caches **results** at the Python → dispatcher boundary (`@cache` goes below `@njit`); Numba's `cache=True` caches **machine code**. They compose: a Cachau HIT skips execution entirely, and a MISS still benefits from Numba's compilation cache. Dispatcher identity covers the Python function, closure captures, and semantically relevant compile options (`fastmath`, `parallel`, `boundscheck`, `error_model`, `locals=` type forcing) — changing any of them invalidates stale results. Metrics are honest about JIT: each specialization's first compile is reported as `cold_compute_seconds` and never counted as normal execution cost. Validated by a 26-test matrix.
 
+### Works with [numba-utils](https://github.com/nicoseijas/numba-utils)
+
+numba-utils' decorator aliases (`njit_fast`, `njit_parallel`, `cached_njit`, `boundscheck`) return real Numba dispatchers, so cachau composes with them out of the box — verified by an [integration suite](tests/test_numba_utils_compat.py):
+
+```python
+from numba_utils.decorators import njit_fast
+from cachau import cache
+
+@cache(persist=True)
+@njit_fast          # fastmath=True lands in the cache identity automatically
+def kernel(values):
+    return values * 2.0
+```
+
+The options the aliases inject (`fastmath`, `parallel`) — and numba-utils' global `configure()` / `NUMBA_UTILS_*` overrides — all land in the dispatcher's compile options, so cachau fingerprints them: `njit_fast` and `cached_njit` with the same body never share an entry, and flipping a global override invalidates correctly. Its typed containers are Level B: as arguments they fail loudly (use `key=` / `ignore=`).
+
 ## Design principles
 
 1. **Correctness before hit rate.** A false HIT is worse than a MISS. When in doubt, recompute.
