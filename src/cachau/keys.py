@@ -37,11 +37,20 @@ def normalize_call(
 
 
 def digest_arguments(
-    func: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
+    func: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    ignore: frozenset[str] = frozenset(),
 ) -> str:
-    """Digest a normalized invocation of ``func`` into a stable hex string."""
+    """Digest a normalized invocation of ``func`` into a stable hex string.
+
+    ``ignore`` names top-level parameters excluded from identity — declared
+    irrelevant by the user (loggers, progress callbacks), never silently.
+    """
     hasher = hashlib.sha256()
     for name, value in normalize_call(func, args, kwargs):
+        if name in ignore:
+            continue
         _emit(hasher, b"arg", name.encode())
         try:
             _feed(hasher, value)
@@ -50,6 +59,19 @@ def digest_arguments(
                 f"argument {name!r} of {func.__qualname__}() cannot be hashed: "
                 f"{exc}. Provide an explicit key= or exclude it with ignore=."
             ) from None
+    return hasher.hexdigest()
+
+
+def digest_custom_key(func: Callable[..., Any], key_value: Any) -> str:
+    """Digest the result of a user-supplied ``key=`` callable."""
+    hasher = hashlib.sha256()
+    _emit(hasher, b"custom-key", b"")
+    try:
+        _feed(hasher, key_value)
+    except UnhashableArgumentError as exc:
+        raise UnhashableArgumentError(
+            f"the key= result for {func.__qualname__}() cannot be hashed: {exc}"
+        ) from None
     return hasher.hexdigest()
 
 

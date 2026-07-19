@@ -17,7 +17,9 @@ from cachau.errors import ConfigurationError
 from cachau.explanation import Explanation
 from cachau.fingerprint import function_fingerprint, function_namespace
 from cachau.flight import KeyedLocks
-from cachau.keys import digest_arguments
+import inspect
+
+from cachau.keys import digest_arguments, digest_custom_key
 from cachau.memory import MemoryBackend
 from cachau.policy import LRUBudget
 from cachau.sizes import estimate_size, parse_size
@@ -224,6 +226,8 @@ def cache(
     max_memory: int | str | None = None,
     persist: Persist | None = None,
     namespace: str | None = None,
+    key: Callable[..., Any] | None = None,
+    ignore: list[str] | tuple[str, ...] | None = None,
     backend: CacheBackend | None = None,
     clock: Clock = ...,
     size_of: SizeOf = ...,
@@ -237,6 +241,8 @@ def cache(
     max_memory: int | str | None = None,
     persist: Persist | None = None,
     namespace: str | None = None,
+    key: Callable[..., Any] | None = None,
+    ignore: list[str] | tuple[str, ...] | None = None,
     backend: CacheBackend | None = None,
     clock: Clock = time.time,
     size_of: SizeOf = estimate_size,
@@ -255,9 +261,12 @@ def cache(
     ``stats()``, ``clear()`` and ``invalidate(...)``.
     """
     if func is not None:
-        return _wrap(func, ttl, max_memory, persist, namespace, backend, clock, size_of)
+        return _wrap(
+            func, ttl, max_memory, persist, namespace, key, ignore, backend,
+            clock, size_of,
+        )
     return lambda f: _wrap(
-        f, ttl, max_memory, persist, namespace, backend, clock, size_of
+        f, ttl, max_memory, persist, namespace, key, ignore, backend, clock, size_of
     )
 
 
@@ -307,17 +316,40 @@ def _purge_stale_fingerprints(
     return purged
 
 
+def _validate_ignore(
+    func: Callable[..., Any], ignore: list[str] | tuple[str, ...] | None
+) -> frozenset[str]:
+    if not ignore:
+        return frozenset()
+    parameters = set(inspect.signature(func).parameters)
+    unknown = set(ignore) - parameters
+    if unknown:
+        raise ConfigurationError(
+            f"ignore= names parameters that {func.__qualname__}() does not "
+            f"have: {sorted(unknown)}"
+        )
+    return frozenset(ignore)
+
+
 def _wrap(
     func: Callable[..., Any],
     ttl: int | float | str | None,
     max_memory: int | str | None,
     persist: Persist | None,
     namespace: str | None,
+    key: Callable[..., Any] | None,
+    ignore: list[str] | tuple[str, ...] | None,
     backend: CacheBackend | None,
     clock: Clock,
     size_of: SizeOf,
 ) -> Callable[..., Any]:
     # Fail fast: bad configuration breaks at decoration time, not on first call.
+    if key is not None and ignore:
+        raise ConfigurationError(
+            "key= and ignore= are mutually exclusive: an explicit key already "
+            "defines the full identity, so there is nothing left to ignore"
+        )
+    ignored_names = _validate_ignore(func, ignore)
     ttl_seconds = parse_ttl(ttl)
     max_memory_bytes = parse_size(max_memory)
     resolved_namespace = namespace if namespace is not None else function_namespace(func)
@@ -349,10 +381,11 @@ def _wrap(
         return max(last_observed, clock())
 
     def build_key(*args: Any, **kwargs: Any) -> str:
-        return (
-            f"{resolved_namespace}:{fingerprint}:"
-            f"{digest_arguments(func, args, kwargs)}"
-        )
+        if key is not None:
+            digest = digest_custom_key(func, key(*args, **kwargs))
+        else:
+            digest = digest_arguments(func, args, kwargs, ignore=ignored_names)
+        return f"{resolved_namespace}:{fingerprint}:{digest}"
 
     def safe_delete(key: str) -> None:
         # A backend delete can fail on disk (locked file, permissions). The
