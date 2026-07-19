@@ -29,10 +29,13 @@ class MemoryBackend:
         if namespace is None:
             self._entries = {}
         else:
+            # Snapshot before rebuilding: concurrent writers must not raise
+            # "dict changed size during iteration". A write landing between
+            # snapshot and reassignment may be dropped — for a cache that is
+            # a benign later miss, never an error.
+            snapshot = list(self._entries.items())
             self._entries = {
-                key: entry
-                for key, entry in self._entries.items()
-                if entry.namespace != namespace
+                key: entry for key, entry in snapshot if entry.namespace != namespace
             }
 
     def iter_entries(self) -> Iterator[tuple[str, CacheEntry]]:

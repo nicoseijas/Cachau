@@ -14,6 +14,14 @@ def run_threads(target, count):
     return threads
 
 
+def wait_for_waiters(cached_func, count, timeout=10.0):
+    """Deterministically wait until `count` threads hold/wait on flight locks."""
+    deadline = time.monotonic() + timeout
+    while cached_func.cache._flights.total_waiters() < count:
+        assert time.monotonic() < deadline, "waiters never arrived"
+        time.sleep(0.005)
+
+
 def test_concurrent_same_key_computes_once():
     compute_started = threading.Event()
     release_compute = threading.Event()
@@ -32,7 +40,7 @@ def test_concurrent_same_key_computes_once():
     assert compute_started.wait(timeout=10)
 
     followers = run_threads(lambda: results.append(slow(1)), 2)
-    time.sleep(0.3)  # let followers reach the per-key lock
+    wait_for_waiters(slow, 3)  # leader + both followers on the per-key lock
     release_compute.set()
     leader.join(timeout=10)
     for thread in followers:
@@ -101,7 +109,7 @@ def test_leader_exception_lets_a_follower_compute():
 
     follower = threading.Thread(target=lambda: results.append(flaky(1)))
     follower.start()
-    time.sleep(0.2)  # follower reaches the per-key lock
+    wait_for_waiters(flaky, 2)  # leader + follower on the per-key lock
     release_compute.set()
     leader.join(timeout=10)
     follower.join(timeout=10)
@@ -135,6 +143,87 @@ def test_sequential_behavior_is_unchanged():
     stats = expensive.cache.stats()
     assert stats.hits == 1
     assert stats.coalesced_hits == 0
+
+
+def test_invalidate_racing_a_read_is_never_served_stale(monkeypatch):
+    """A quarantining invalidate that lands between the fast path's pending
+    check and its backend read must still prevent serving the stale entry."""
+    from cachau.memory import MemoryBackend
+
+    state = {"armed": False}
+
+    class RacingBackend(MemoryBackend):
+        def get(self, key):
+            entry = super().get(key)
+            if state["armed"]:
+                state["armed"] = False
+                # Simulate a concurrent invalidate whose physical delete
+                # fails, interleaved exactly after this read began.
+                raising = OSError("locked")
+
+                def failing_delete(k):
+                    raise raising
+
+                original = self.delete
+                self.delete = failing_delete
+                try:
+                    expensive.cache.invalidate(1)
+                finally:
+                    self.delete = original
+            return entry
+
+    backend = RacingBackend()
+    calls = []
+
+    @cache(backend=backend)
+    def expensive(x):
+        calls.append(x)
+        return x * 2
+
+    expensive(1)
+    state["armed"] = True
+    assert expensive(1) == 2  # must recompute: the entry was condemned mid-read
+    assert calls == [1, 1]
+    assert expensive.cache.stats().miss_invalidated == 1
+
+
+def test_stress_concurrent_invalidates_and_calls():
+    """clear()/invalidate() racing live flights: no crashes, correct values."""
+    stop = threading.Event()
+    failures = []
+
+    @cache
+    def expensive(x):
+        return x * 2
+
+    def caller(seed):
+        try:
+            for i in range(300):
+                key = (seed + i) % 4
+                assert expensive(key) == key * 2
+        except Exception as exc:  # noqa: BLE001 - collected for the assertion
+            failures.append(exc)
+
+    def chaos():
+        try:
+            while not stop.is_set():
+                expensive.cache.invalidate(1)
+                expensive.cache.invalidate(2)
+                expensive.cache.clear()
+        except Exception as exc:  # noqa: BLE001
+            failures.append(exc)
+
+    chaos_thread = threading.Thread(target=chaos)
+    chaos_thread.start()
+    callers = [threading.Thread(target=caller, args=(n,)) for n in range(6)]
+    for thread in callers:
+        thread.start()
+    for thread in callers:
+        thread.join(timeout=60)
+    stop.set()
+    chaos_thread.join(timeout=10)
+
+    assert failures == []
 
 
 def test_stress_many_threads_many_keys():

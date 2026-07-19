@@ -32,16 +32,30 @@ class KeyedLocks:
                 slot = [threading.Lock(), 0]
                 self._slots[key] = slot
             slot[1] += 1
-        slot[0].acquire()
+        try:
+            # acquire() is inside the try so an async interrupt (Ctrl-C)
+            # delivered while blocked still releases the refcount.
+            slot[0].acquire()
+        except BaseException:
+            self._release_ref(key, slot)
+            raise
         try:
             yield
         finally:
             slot[0].release()
-            with self._registry_guard:
-                slot[1] -= 1
-                if slot[1] == 0:
-                    self._slots.pop(key, None)
+            self._release_ref(key, slot)
+
+    def _release_ref(self, key: str, slot: list) -> None:
+        with self._registry_guard:
+            slot[1] -= 1
+            if slot[1] == 0:
+                self._slots.pop(key, None)
 
     def active_keys(self) -> int:
         with self._registry_guard:
             return len(self._slots)
+
+    def total_waiters(self) -> int:
+        """Threads currently holding or waiting on any key (test/introspection)."""
+        with self._registry_guard:
+            return sum(slot[1] for slot in self._slots.values())

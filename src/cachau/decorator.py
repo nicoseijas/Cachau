@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import os
 import pathlib
+import threading
 import time
 from collections import OrderedDict
 from typing import Any, Callable, Iterable, TypeVar, overload
@@ -33,6 +34,7 @@ _perf_counter = time.perf_counter
 # Bounded cap for miss-reason attribution markers (label-only: dropping one
 # can mislabel a future miss as not_found, never affect correctness).
 _INVALIDATION_MARKER_CAP = 4096
+_MARKER_MISSING = object()
 Persist = bool | str | os.PathLike
 
 
@@ -50,6 +52,7 @@ class CacheControl:
         budget: LRUBudget | None,
         key_builder: KeyBuilder,
         now: Clock,
+        flights: KeyedLocks,
         code_change_invalidations: int = 0,
     ) -> None:
         self.namespace = namespace
@@ -87,6 +90,11 @@ class CacheControl:
         self._budget = budget
         self._key_builder = key_builder
         self._now = now
+        self._flights = flights
+        # Guards compound mutations of the invalidation bookkeeping, which is
+        # function-wide state reachable from concurrent flights of different
+        # keys. Never held across backend I/O or a computation.
+        self._mutation_guard = threading.Lock()
 
     def explain(self, *args: Any, **kwargs: Any) -> Explanation:
         """Explain what a call with these arguments would do, and why.
@@ -127,25 +135,34 @@ class CacheControl:
         self._backend.clear(namespace=self.namespace)
         if self._budget is not None:
             self._budget.reset()
-        self._invalidation_markers.clear()
-        self._pending_invalidations.clear()
+        with self._mutation_guard:
+            self._invalidation_markers.clear()
+            self._pending_invalidations.clear()
 
     def invalidate(self, *args: Any, **kwargs: Any) -> None:
-        """Forget the stored result for one specific invocation."""
+        """Forget the stored result for one specific invocation.
+
+        Serialized with any in-flight computation of the same key (per-key
+        lock), so it can never interleave with a commit and leave the budget
+        or bookkeeping inconsistent with the backend.
+        """
         key = self._key_builder(*args, **kwargs)
-        try:
-            self._backend.delete(key)
-        except Exception:  # noqa: BLE001 - a failed delete never raises to callers
-            self.delete_errors += 1
-            self._pending_invalidations.add(key)
-        else:
-            self._invalidation_markers[key] = None
-            self._invalidation_markers.move_to_end(key)
-            while len(self._invalidation_markers) > _INVALIDATION_MARKER_CAP:
-                self._invalidation_markers.popitem(last=False)
-        if self._budget is not None:
-            self._budget.forget(key)
-        self.invalidations += 1
+        with self._flights.holding(key):
+            try:
+                self._backend.delete(key)
+            except Exception:  # noqa: BLE001 - a failed delete never raises
+                self.delete_errors += 1
+                with self._mutation_guard:
+                    self._pending_invalidations.add(key)
+            else:
+                with self._mutation_guard:
+                    self._invalidation_markers[key] = None
+                    self._invalidation_markers.move_to_end(key)
+                    while len(self._invalidation_markers) > _INVALIDATION_MARKER_CAP:
+                        self._invalidation_markers.popitem(last=False)
+            if self._budget is not None:
+                self._budget.forget(key)
+            self.invalidations += 1
 
     def stats(self) -> CacheStats:
         """An immutable snapshot of this function's cache activity."""
@@ -310,15 +327,19 @@ def _wrap(
     flights = KeyedLocks()
     purged = _purge_stale_fingerprints(store, resolved_namespace, fingerprint)
     last_observed = float("-inf")
+    clock_guard = threading.Lock()
 
     def now() -> float:
         # TTL uses wall-clock time because expires_at must survive process
         # restarts once persistence lands. Wall clocks can step backward (NTP,
         # VM resume); clamping to the last observed reading keeps time monotone
-        # for this function so an entry can never appear to grow younger.
+        # for this function so an entry can never appear to grow younger. The
+        # guard prevents concurrent flights from racing the read-modify-write
+        # and sliding the ratchet backward.
         nonlocal last_observed
-        last_observed = max(last_observed, clock())
-        return last_observed
+        with clock_guard:
+            last_observed = max(last_observed, clock())
+            return last_observed
 
     def peek_now() -> float:
         # Read-only view of the same clamped clock, for pure observers
@@ -356,6 +377,11 @@ def _wrap(
             return _NOT_SERVED
         entry = store.get(key)
         if entry is None or entry.is_expired(now()):
+            return _NOT_SERVED
+        if key in control._pending_invalidations:
+            # Re-check after the read: a concurrent invalidate whose physical
+            # delete failed may have quarantined the key while we were reading
+            # the backend. Never serve a condemned entry.
             return _NOT_SERVED
         if budget is not None:
             budget.touch(key)
@@ -404,11 +430,15 @@ def _wrap(
                 if budget is not None:
                     budget.forget(key)
                 control.miss_expired += 1
-            elif key in control._invalidation_markers:
-                del control._invalidation_markers[key]
-                control.miss_invalidated += 1
             else:
-                control.miss_not_found += 1
+                # Atomic pop: a concurrent clear() or marker-cap eviction must
+                # not turn check-then-delete into a KeyError.
+                with control._mutation_guard:
+                    marker = control._invalidation_markers.pop(key, _MARKER_MISSING)
+                if marker is not _MARKER_MISSING:
+                    control.miss_invalidated += 1
+                else:
+                    control.miss_not_found += 1
         compute_started = _perf_counter()
         value = func(*args, **kwargs)
         compute_elapsed = _perf_counter() - compute_started
@@ -471,6 +501,7 @@ def _wrap(
         budget=budget,
         key_builder=build_key,
         now=peek_now,
+        flights=flights,
         code_change_invalidations=purged,
     )
     wrapper.cache = control  # type: ignore[attr-defined]
