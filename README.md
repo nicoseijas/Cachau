@@ -1,5 +1,7 @@
 # Cachau
 
+[![PyPI](https://img.shields.io/pypi/v/cachau)](https://pypi.org/project/cachau/) [![Python](https://img.shields.io/pypi/pyversions/cachau)](https://pypi.org/project/cachau/) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 **Delightful, observable, bounded, and persistent function caching for Python data workloads.**
 
 Cachau is a function cache designed around the real problems of data science: large arguments, expensive computations, notebooks that restart, voluminous results, invalidation when code or data changes, and explicit memory and disk limits.
@@ -22,20 +24,45 @@ def expensive_analysis(df, config):
 pip install cachau
 ```
 
+Python 3.10+. **Zero dependencies** — NumPy, pandas, and Numba integrations activate automatically when those libraries are present, without ever importing them.
+
+## Quick start
+
+```python
+from cachau import cache
+
+@cache(persist=True, max_memory="500MB")
+def slow_square(n):
+    print("computing...")
+    return n * n
+
+slow_square(12)              # computing...  → 144
+slow_square(12)              # → 144 (HIT — and it survives a restart)
+
+slow_square.cache.stats().hit_rate   # 0.5
+print(slow_square.cache.explain(12))
+# HIT
+# Reason:      found
+# Namespace:   __main__.slow_square
+# Created:     2026-07-19 18:02:33 UTC
+# Age:         0s
+# Size:        28 B
+```
+
 ## Why not just `functools.lru_cache` / joblib / diskcache?
 
 Plenty of libraries offer TTL, persistence, or LRU. None of them combine what data workloads actually need:
 
 | Problem | Cachau's answer |
 |---|---|
-| Hashing a 2 GB DataFrame just to build a key | Native, optimized hashing for NumPy, pandas, and Polars — plus explicit `key=` / `ignore=` escape hatches |
-| Stale results after you edit the function | Code-fingerprint invalidation by default: change `x * 2` to `x * 3`, the old result dies |
-| Results that outlive the data they came from | `depends_on=["data.csv"]` — invalidate on file, env var, or package changes |
-| Caches that eat all your RAM or disk | First-class `max_memory` bounds with predictable LRU eviction |
-| Notebook restarts throwing work away | `persist=True` — atomic, versioned on-disk format that survives restarts |
-| "Why was that a miss?!" | `func.cache.explain(...)` tells you exactly what happened and why |
-| Caching that silently makes things *slower* | `func.cache.profile(...)` measures whether caching is even worth it |
-| Numba treated as an afterthought | First-class support at the dispatcher boundary — `fastmath`/`parallel`-aware identity, honest cold/warm JIT metrics |
+| Hashing a 2 GB DataFrame just to build a key | Native hashing for NumPy and pandas (dtype + shape + content; layout-canonicalized) — plus explicit `key=` / `ignore=` escape hatches |
+| Stale results after you edit the function | Code-fingerprint invalidation by default: change `x * 2` to `x * 3` — or a closure capture, or a Numba compile flag — and the old result dies |
+| N threads recomputing the same missing key | Same-key single-flight: one computation, everyone else reuses it; independent keys never serialize |
+| Caches that eat all your RAM or disk | First-class `max_memory` bounds with predictable LRU eviction; oversized results are returned but never cached |
+| Notebook restarts throwing work away | `persist=True` — atomic, versioned, corruption-safe on-disk format that survives restarts |
+| "Why was that a miss?!" | `func.cache.explain(...)` tells you exactly what happened and why — as pure observation |
+| Numba treated as an afterthought | First-class support at the dispatcher boundary — `fastmath`/`parallel`/`locals=`-aware identity, honest per-specialization cold/warm JIT metrics |
+| Results that outlive the data they came from | `depends_on=["data.csv"]` — *coming in V1.1*, with `profile()` (is caching even worth it?) |
 
 ## A taste of the API
 
@@ -76,11 +103,13 @@ Coming in V1.1: `@cache(depends_on=["data/train.parquet"])` — invalidation whe
 Every cached function carries its own control surface:
 
 ```python
-build_features.cache.stats()        # hits, misses, hit rate, bytes, time saved...
+build_features.cache.stats()        # hits, misses, hit rate, miss reasons, bytes,
+                                    # evictions, compute time, estimated time saved,
+                                    # cold-JIT time — as an immutable snapshot
 build_features.cache.clear()
 build_features.cache.invalidate(df, config)
-build_features.cache.explain(df, config)
-build_features.cache.profile(df, config)
+build_features.cache.explain(df, config)     # pure observation, never recomputes
+build_features.cache.profile(df, config)     # coming in V1.1
 ```
 
 ### `explain()` — transparency on demand
