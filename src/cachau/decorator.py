@@ -13,6 +13,7 @@ from cachau.backend import CacheBackend, CacheEntry, EntryMetadata
 from cachau.disk import DiskBackend
 from cachau.durations import parse_ttl
 from cachau.errors import ConfigurationError
+from cachau.explanation import Explanation
 from cachau.fingerprint import function_fingerprint, function_namespace
 from cachau.keys import digest_arguments
 from cachau.memory import MemoryBackend
@@ -47,6 +48,7 @@ class CacheControl:
         max_memory_bytes: int | None,
         budget: LRUBudget | None,
         key_builder: KeyBuilder,
+        now: Clock,
         code_change_invalidations: int = 0,
     ) -> None:
         self.namespace = namespace
@@ -82,6 +84,41 @@ class CacheControl:
         self._backend = backend
         self._budget = budget
         self._key_builder = key_builder
+        self._now = now
+
+    def explain(self, *args: Any, **kwargs: Any) -> Explanation:
+        """Explain what a call with these arguments would do, and why.
+
+        Pure observation: never executes the function, never mutates cache
+        state, counters, invalidation bookkeeping, or LRU recency.
+        """
+        key = self._key_builder(*args, **kwargs)
+        checked_at = self._now()
+        common = {
+            "key": key,
+            "namespace": self.namespace,
+            "fingerprint": self.fingerprint,
+            "checked_at": checked_at,
+        }
+        if key in self._pending_invalidations:
+            return Explanation(outcome="MISS", reason="invalidated", **common)
+        # peek() is the non-destructive read (DiskBackend.get removes corrupt
+        # files as read-side maintenance; observation must not).
+        peek = getattr(self._backend, "peek", self._backend.get)
+        entry = peek(key)
+        if entry is None:
+            reason = (
+                "invalidated" if key in self._invalidation_markers else "not_found"
+            )
+            return Explanation(outcome="MISS", reason=reason, **common)
+        facts = {
+            "created_at": entry.created_at,
+            "expires_at": entry.expires_at,
+            "size_bytes": entry.size,
+        }
+        if entry.is_expired(checked_at):
+            return Explanation(outcome="MISS", reason="expired", **common, **facts)
+        return Explanation(outcome="HIT", reason="found", **common, **facts)
 
     def clear(self) -> None:
         """Forget every stored result for this function."""
@@ -279,6 +316,13 @@ def _wrap(
         last_observed = max(last_observed, clock())
         return last_observed
 
+    def peek_now() -> float:
+        # Read-only view of the same clamped clock, for pure observers
+        # (explain, and profile later): sees what the wrapper would see
+        # without advancing the ratchet, so a transient clock spike observed
+        # only through an observation call can never poison future writes.
+        return max(last_observed, clock())
+
     def build_key(*args: Any, **kwargs: Any) -> str:
         return (
             f"{resolved_namespace}:{fingerprint}:"
@@ -393,6 +437,7 @@ def _wrap(
         max_memory_bytes=max_memory_bytes,
         budget=budget,
         key_builder=build_key,
+        now=peek_now,
         code_change_invalidations=purged,
     )
     wrapper.cache = control  # type: ignore[attr-defined]
