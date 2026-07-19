@@ -19,6 +19,7 @@ htmlcov/
 
 # Cachau's own default cache dir (used in docs/examples)
 .cache/
+.cachau/
 
 # OS / editor noise
 .DS_Store
