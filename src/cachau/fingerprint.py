@@ -158,12 +158,51 @@ def _feed_closure(hasher: Any, func: Callable[..., Any], seen: set[int]) -> None
                 )
 
 
+def _feed_framed(hasher: Any, tag: bytes, payload: bytes) -> None:
+    """Feed one component so adjacent components can never run together.
+
+    Concatenating raw components makes the digest ambiguous: ``co_code``
+    stores constant INDICES, not values, so two functions differing only in
+    numeric literals have byte-identical bytecode — and constants whose repr
+    carries no quoting then run together, making ``(None, 1, 23)`` and
+    ``(None, 12, 3)`` both spell ``None123``. Identical fingerprint means
+    identical key, and the cache serves one function's value for the other:
+    a false HIT, the worst failure this library can produce. A separator byte
+    would not be enough (a string constant's repr can contain nearly
+    anything), so each component carries its own length.
+    """
+    hasher.update(tag)
+    hasher.update(str(len(payload)).encode())
+    hasher.update(b":")
+    hasher.update(payload)
+
+
 def _feed_code(hasher: Any, code: types.CodeType) -> None:
-    hasher.update(code.co_code)
-    hasher.update(",".join(code.co_names).encode())
-    hasher.update(",".join(code.co_varnames).encode())
+    _feed_framed(hasher, b"|code:", code.co_code)
+    _feed_framed(hasher, b"|names:", ",".join(code.co_names).encode())
+    _feed_framed(hasher, b"|varnames:", ",".join(code.co_varnames).encode())
     for const in code.co_consts:
         if isinstance(const, types.CodeType):
+            hasher.update(b"|nested:")  # its components frame themselves
             _feed_code(hasher, const)
         else:
-            hasher.update(repr(const).encode())
+            _feed_framed(hasher, b"|const:", _canonical_const(const).encode())
+
+
+def _canonical_const(const: Any) -> str:
+    """Render a code constant in a process-independent way.
+
+    ``repr`` of a set iterates in hash order, which ``PYTHONHASHSEED``
+    randomizes per process — and the peephole optimizer turns ``x in {"a"}``
+    into a frozenset constant, so ordinary code is affected. An unstable
+    fingerprint is not a correctness bug (it can only cause a MISS, never a
+    false HIT), but it silently defeats ``persist=``: every restart would
+    fail to find its own entries. Sorting the RENDERED elements avoids
+    assuming they are mutually comparable.
+    """
+    if isinstance(const, (frozenset, set)):
+        elements = ",".join(sorted(_canonical_const(item) for item in const))
+        return f"{type(const).__name__}({{{elements}}})"
+    if isinstance(const, tuple):  # tuple constants can contain set constants
+        return "(" + ",".join(_canonical_const(item) for item in const) + ")"
+    return repr(const)

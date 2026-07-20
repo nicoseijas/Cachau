@@ -42,6 +42,28 @@ _perf_counter = time.perf_counter
 _INVALIDATION_MARKER_CAP = 4096
 _MARKER_MISSING = object()
 Persist = bool | str | os.PathLike
+# Every tally CacheControl keeps. Naming them once gives stats() an explicit
+# snapshot set and gives _bump() a checkable vocabulary (see the test that
+# asserts no _bump call names anything outside this tuple).
+TALLY_NAMES = (
+    "hits",
+    "coalesced_hits",
+    "miss_not_found",
+    "miss_expired",
+    "miss_invalidated",
+    "writes",
+    "evictions",
+    "skipped_oversized",
+    "size_estimate_failures",
+    "write_errors",
+    "delete_errors",
+    "invalidations",
+    "code_change_invalidations",
+    "total_compute_seconds",
+    "compute_count",
+    "estimated_saved_seconds",
+    "cold_compute_seconds",
+)
 
 
 class CacheControl:
@@ -60,6 +82,7 @@ class CacheControl:
         now: Clock,
         flights: KeyedLocks,
         code_change_invalidations: int = 0,
+        evictions: int = 0,
     ) -> None:
         self.namespace = namespace
         self.fingerprint = fingerprint
@@ -71,7 +94,9 @@ class CacheControl:
         self.miss_expired = 0
         self.miss_invalidated = 0
         self.writes = 0
-        self.evictions = 0
+        # Seeded: rehydrating the budget over a persistent store can already
+        # have evicted, before the first call of this process.
+        self.evictions = evictions
         self.skipped_oversized = 0
         self.size_estimate_failures = 0
         self.write_errors = 0
@@ -102,6 +127,45 @@ class CacheControl:
         # function-wide state reachable from concurrent flights of different
         # keys. Never held across backend I/O or a computation.
         self._mutation_guard = threading.Lock()
+        # Guards the tallies. Single-flight only serializes callers of the
+        # SAME key, so different-key flights land here concurrently, and
+        # `+=` on an attribute is a read-modify-write the language does not
+        # promise to be atomic — it only happens to be one under the GIL.
+        # A lost increment never corrupts a cached value, but observability
+        # is a documented feature, and free-threaded builds drop the
+        # accidental protection entirely. Never held across I/O.
+        self._counter_guard = threading.Lock()
+
+    def _bump(self, name: str, amount: float = 1) -> None:
+        """Add to one tally atomically."""
+        with self._counter_guard:
+            setattr(self, name, getattr(self, name) + amount)
+
+    def _record_hit(self, *, coalesced: bool) -> None:
+        """Tally a hit and the time it saved, as one indivisible update."""
+        with self._counter_guard:
+            self.hits += 1
+            if coalesced:
+                self.coalesced_hits += 1
+            if self._saved_basis_count:
+                # Read basis and count together: separately, a concurrent
+                # commit could land between them and skew the average.
+                self.estimated_saved_seconds += (
+                    self._saved_basis_seconds / self._saved_basis_count
+                )
+
+    def _record_commit(self, compute_elapsed: float | None) -> None:
+        """Tally a successful write; ``None`` excludes it from the savings basis."""
+        with self._counter_guard:
+            self.writes += 1
+            if compute_elapsed is not None:
+                self._saved_basis_seconds += compute_elapsed
+                self._saved_basis_count += 1
+
+    def _record_compute(self, compute_elapsed: float) -> None:
+        with self._counter_guard:
+            self.total_compute_seconds += compute_elapsed
+            self.compute_count += 1
 
     def explain(self, *args: Any, **kwargs: Any) -> Explanation:
         """Explain what a call with these arguments would do, and why.
@@ -158,7 +222,7 @@ class CacheControl:
             try:
                 self._backend.delete(key)
             except Exception:  # noqa: BLE001 - a failed delete never raises
-                self.delete_errors += 1
+                self._bump("delete_errors")
                 with self._mutation_guard:
                     self._pending_invalidations.add(key)
             else:
@@ -169,7 +233,7 @@ class CacheControl:
                         self._invalidation_markers.popitem(last=False)
             if self._budget is not None:
                 self._budget.forget(key)
-            self.invalidations += 1
+            self._bump("invalidations")
 
     def stats(self) -> CacheStats:
         """An immutable snapshot of this function's cache activity."""
@@ -180,45 +244,48 @@ class CacheControl:
                 entries += 1
                 if row.size is not None:
                     current_bytes += row.size
-        misses = self.miss_not_found + self.miss_expired + self.miss_invalidated
-        total_calls = self.hits + misses
+        # Copy the tallies in one locked read: individually they would come
+        # from different instants, so a snapshot taken under live traffic
+        # could report a hit_rate that no moment ever had. The backend scan
+        # above stays OUTSIDE the guard — it is I/O, and holding the tallies
+        # lock across it would stall every concurrent call.
+        with self._counter_guard:
+            tally = {name: getattr(self, name) for name in TALLY_NAMES}
+        misses = (
+            tally["miss_not_found"] + tally["miss_expired"] + tally["miss_invalidated"]
+        )
+        total_calls = tally["hits"] + misses
         return CacheStats(
-            hits=self.hits,
-            coalesced_hits=self.coalesced_hits,
+            hits=tally["hits"],
+            coalesced_hits=tally["coalesced_hits"],
             misses=misses,
-            hit_rate=self.hits / total_calls if total_calls else 0.0,
-            miss_not_found=self.miss_not_found,
-            miss_expired=self.miss_expired,
-            miss_invalidated=self.miss_invalidated,
-            expirations=self.miss_expired,
-            writes=self.writes,
+            hit_rate=tally["hits"] / total_calls if total_calls else 0.0,
+            miss_not_found=tally["miss_not_found"],
+            miss_expired=tally["miss_expired"],
+            miss_invalidated=tally["miss_invalidated"],
+            expirations=tally["miss_expired"],
+            writes=tally["writes"],
             skipped_writes=(
-                self.skipped_oversized
-                + self.size_estimate_failures
-                + self.write_errors
+                tally["skipped_oversized"]
+                + tally["size_estimate_failures"]
+                + tally["write_errors"]
             ),
-            skipped_oversized=self.skipped_oversized,
-            size_estimate_failures=self.size_estimate_failures,
-            write_errors=self.write_errors,
-            delete_errors=self.delete_errors,
-            evictions=self.evictions,
-            invalidations=self.invalidations,
-            code_change_invalidations=self.code_change_invalidations,
+            skipped_oversized=tally["skipped_oversized"],
+            size_estimate_failures=tally["size_estimate_failures"],
+            write_errors=tally["write_errors"],
+            delete_errors=tally["delete_errors"],
+            evictions=tally["evictions"],
+            invalidations=tally["invalidations"],
+            code_change_invalidations=tally["code_change_invalidations"],
             entries=entries,
             current_bytes=current_bytes,
-            total_compute_seconds=self.total_compute_seconds,
-            estimated_saved_seconds=self.estimated_saved_seconds,
-            cold_compute_seconds=self.cold_compute_seconds,
+            total_compute_seconds=tally["total_compute_seconds"],
+            estimated_saved_seconds=tally["estimated_saved_seconds"],
+            cold_compute_seconds=tally["cold_compute_seconds"],
         )
 
     def _iter_metadata(self) -> Iterable[EntryMetadata]:
-        iter_metadata = getattr(self._backend, "iter_metadata", None)
-        if iter_metadata is not None:
-            return iter_metadata()
-        return (
-            EntryMetadata(key, entry.namespace, entry.size)
-            for key, entry in self._backend.iter_entries()
-        )
+        return _metadata_rows(self._backend)
 
 
 @overload
@@ -290,8 +357,82 @@ def _resolve_backend(
     return backend if backend is not None else _default_backend
 
 
+def _metadata_rows(store: CacheBackend) -> Iterable[EntryMetadata]:
+    """Per-entry metadata, without deserializing payloads where possible.
+
+    ``iter_metadata`` is optional in the backend protocol, so a third-party
+    store that only implements ``iter_entries`` still works — it just pays
+    for the deserialization.
+    """
+    iter_metadata = getattr(store, "iter_metadata", None)
+    if iter_metadata is not None:
+        return iter_metadata()
+    return (
+        EntryMetadata(key, entry.namespace, entry.size, entry.created_at)
+        for key, entry in store.iter_entries()
+    )
+
+
+def _best_effort_delete(store: CacheBackend, key: str) -> None:
+    # Decoration-time cleanup: a store that refuses a delete leaves a
+    # still-correct entry behind, never a wrong one. Never raise into
+    # the user's import.
+    try:
+        store.delete(key)
+    except Exception:  # noqa: BLE001 - best-effort cleanup at decoration
+        pass
+
+
+def _rehydrate_budget(
+    store: CacheBackend,
+    budget: LRUBudget,
+    namespace: str,
+    fingerprint: str,
+    rows: Iterable[EntryMetadata],
+) -> int:
+    """Re-seed the budget from entries already in the store; return evictions.
+
+    A budget built empty over a non-empty persistent store believes it has
+    full capacity, so ``persist=`` + ``max_memory=`` would stop enforcing the
+    bound after every restart — the limit is supposed to hold ACROSS restarts,
+    not merely within one process.
+
+    Entries are re-admitted oldest-first: creation order is the only ordering
+    a store preserves, since real LRU recency is process-local and dies with
+    the process. Eviction therefore resumes from the oldest surviving entry.
+
+    Entries with no recorded size (written before ``max_memory`` was set)
+    cannot be budgeted without deserializing their payload, which decoration
+    must not pay for; they are left in place, outside the bound, and fall out
+    naturally as they are re-read and rewritten.
+    """
+    current_prefix = f"{namespace}:{fingerprint}:"
+    sized: list[tuple[float, str, int]] = [
+        (row.created_at if row.created_at is not None else 0.0, row.key, row.size)
+        for row in rows
+        if row.namespace == namespace
+        and row.key.startswith(current_prefix)
+        and row.size is not None
+    ]
+    # The key breaks ties, so entries written within one clock tick — or in a
+    # store that records no timestamps — still rehydrate deterministically.
+    sized.sort()
+    evictions = 0
+    for _, key, size in sized:
+        if not budget.fits(size):
+            # Larger than the whole budget: it could never be admitted again,
+            # and leaving it would keep unbounded bytes on disk forever.
+            _best_effort_delete(store, key)
+            evictions += 1
+            continue
+        for evicted_key in budget.admit(key, size):
+            _best_effort_delete(store, evicted_key)
+            evictions += 1
+    return evictions
+
+
 def _purge_stale_fingerprints(
-    store: CacheBackend, namespace: str, fingerprint: str
+    store: CacheBackend, namespace: str, fingerprint: str, rows: Iterable[EntryMetadata]
 ) -> int:
     """Delete this namespace's entries written under a different fingerprint.
 
@@ -302,15 +443,6 @@ def _purge_stale_fingerprints(
     Returns how many entries were invalidated.
     """
     current_prefix = f"{namespace}:{fingerprint}:"
-    iter_metadata = getattr(store, "iter_metadata", None)
-    rows: Iterable[EntryMetadata] = (
-        iter_metadata()
-        if iter_metadata is not None
-        else (
-            EntryMetadata(key, entry.namespace, entry.size)
-            for key, entry in store.iter_entries()
-        )
-    )
     purged = 0
     for row in rows:
         if row.namespace == namespace and not row.key.startswith(current_prefix):
@@ -364,7 +496,18 @@ def _wrap(
     store: CacheBackend = _resolve_backend(persist, backend)
     budget = LRUBudget(max_memory_bytes) if max_memory_bytes is not None else None
     flights = KeyedLocks()
-    purged = _purge_stale_fingerprints(store, resolved_namespace, fingerprint)
+    # One pass over the store for both decoration-time chores: decoration
+    # runs at import, and each pass is another round of file opens across the
+    # whole cache directory. Purge and rehydration touch disjoint rows (one
+    # takes every OTHER fingerprint, the other only this one), so a single
+    # snapshot is safe even though purge deletes as it goes.
+    rows = list(_metadata_rows(store))
+    purged = _purge_stale_fingerprints(store, resolved_namespace, fingerprint, rows)
+    rehydrated_evictions = (
+        _rehydrate_budget(store, budget, resolved_namespace, fingerprint, rows)
+        if budget is not None
+        else 0
+    )
     last_observed = float("-inf")
     clock_guard = threading.Lock()
 
@@ -402,7 +545,7 @@ def _wrap(
         try:
             store.delete(key)
         except Exception:
-            control.delete_errors += 1
+            control._bump("delete_errors")
 
     _NOT_SERVED = object()
 
@@ -425,13 +568,7 @@ def _wrap(
             return _NOT_SERVED
         if budget is not None:
             budget.touch(key)
-        control.hits += 1
-        if coalesced:
-            control.coalesced_hits += 1
-        if control._saved_basis_count:
-            control.estimated_saved_seconds += (
-                control._saved_basis_seconds / control._saved_basis_count
-            )
+        control._record_hit(coalesced=coalesced)
         return entry.value
 
     @functools.wraps(func)
@@ -458,10 +595,10 @@ def _wrap(
                 store.delete(key)
                 control._pending_invalidations.discard(key)
             except Exception:
-                control.delete_errors += 1
+                control._bump("delete_errors")
             if budget is not None:
                 budget.forget(key)
-            control.miss_invalidated += 1
+            control._bump("miss_invalidated")
         else:
             entry = store.get(key)
             if entry is not None:
@@ -469,16 +606,16 @@ def _wrap(
                 safe_delete(key)
                 if budget is not None:
                     budget.forget(key)
-                control.miss_expired += 1
+                control._bump("miss_expired")
             else:
                 # Atomic pop: a concurrent clear() or marker-cap eviction must
                 # not turn check-then-delete into a KeyError.
                 with control._mutation_guard:
                     marker = control._invalidation_markers.pop(key, _MARKER_MISSING)
                 if marker is not _MARKER_MISSING:
-                    control.miss_invalidated += 1
+                    control._bump("miss_invalidated")
                 else:
-                    control.miss_not_found += 1
+                    control._bump("miss_not_found")
         specializations_before = -1
         if jit_boundary:
             known_signatures = getattr(func, "signatures", None)
@@ -487,8 +624,7 @@ def _wrap(
         compute_started = _perf_counter()
         value = func(*args, **kwargs)
         compute_elapsed = _perf_counter() - compute_started
-        control.total_compute_seconds += compute_elapsed
-        control.compute_count += 1
+        control._record_compute(compute_elapsed)
         # Cold JIT is per SPECIALIZATION, not per function: a new dtype on a
         # later call triggers a fresh compile. Detect it by whether the
         # dispatcher grew a compiled signature during this execution, and
@@ -502,7 +638,7 @@ def _wrap(
             else:
                 is_cold_jit = control.compute_count == 1
             if is_cold_jit:
-                control.cold_compute_seconds += compute_elapsed
+                control._bump("cold_compute_seconds", compute_elapsed)
         committed_at = now()  # TTL starts at commit, not at call start
         size: int | None = None
         if budget is not None:
@@ -512,19 +648,19 @@ def _wrap(
             try:
                 size = int(size_of(value))
             except Exception:
-                control.size_estimate_failures += 1
+                control._bump("size_estimate_failures")
                 return value
             if size < 0:
-                control.size_estimate_failures += 1
+                control._bump("size_estimate_failures")
                 return value
             if not budget.fits(size):
                 # Oversized: compute, return, never cache, never flush the
                 # cache to make room for a pathological entry.
-                control.skipped_oversized += 1
+                control._bump("skipped_oversized")
                 return value
             for evicted_key in budget.admit(key, size):
                 safe_delete(evicted_key)
-                control.evictions += 1
+                control._bump("evictions")
         try:
             store.set(
                 key,
@@ -538,16 +674,13 @@ def _wrap(
                     size=size,
                 ),
             )
-            control.writes += 1
+            control._record_commit(None if is_cold_jit else compute_elapsed)
             control._pending_invalidations.discard(key)  # fresh value overwrote it
-            if not is_cold_jit:
-                control._saved_basis_seconds += compute_elapsed
-                control._saved_basis_count += 1
         except Exception:
             # The cache is an optimization: a failed write (serialization,
             # disk) never loses the computed result. Release the budget slot
             # so a phantom entry cannot shrink future capacity.
-            control.write_errors += 1
+            control._bump("write_errors")
             if budget is not None:
                 budget.forget(key)
         return value
@@ -563,6 +696,7 @@ def _wrap(
         now=peek_now,
         flights=flights,
         code_change_invalidations=purged,
+        evictions=rehydrated_evictions,
     )
     wrapper.cache = control  # type: ignore[attr-defined]
     return wrapper

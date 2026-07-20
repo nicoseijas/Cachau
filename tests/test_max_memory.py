@@ -224,3 +224,90 @@ def test_default_size_estimator_smoke():
 
     assert expensive(1) == b"x" * 1000
     assert expensive(1) == b"x" * 1000
+
+
+# --- Budget rehydration across restarts (issue #11) -------------------------
+#
+# A budget that starts empty over a non-empty store silently stops enforcing
+# the bound: the promise of `persist=` + `max_memory=` is that the limit holds
+# ACROSS restarts, not just within one process. These tests observe with
+# explain(), never with a captured log — a mutated closure would change the
+# function's fingerprint and purge the very entries under test.
+
+
+def _define_sized(persist_dir, max_memory, namespace="rehydrate.expensive"):
+    """Re-decorate the same function over an existing cache directory."""
+
+    @cache(
+        persist=str(persist_dir),
+        max_memory=max_memory,
+        namespace=namespace,
+        size_of=lambda v: 100,
+    )
+    def expensive(x):
+        return x
+
+    return expensive
+
+
+def _outcome(cached, x):
+    return cached.cache.explain(x).outcome
+
+
+def test_budget_is_rebuilt_from_persisted_entries(tmp_path):
+    first = _define_sized(tmp_path, 250)
+    first("a")
+    first("b")
+    assert first.cache.stats().current_bytes == 200
+
+    second = _define_sized(tmp_path, 250)  # simulated restart
+    second("c")  # 300 > 250: must evict, not overflow
+    stats = second.cache.stats()
+    assert stats.current_bytes <= 250
+    assert stats.entries == 2
+    assert second.cache.evictions >= 1
+
+
+def test_rehydrated_budget_evicts_in_creation_order(tmp_path):
+    first = _define_sized(tmp_path, 250)
+    first("a")
+    first("b")
+
+    second = _define_sized(tmp_path, 250)
+    second("c")  # evicts the oldest surviving entry, "a"
+    assert _outcome(second, "a") == "MISS"
+    assert _outcome(second, "b") == "HIT"
+    assert _outcome(second, "c") == "HIT"
+
+
+def test_rehydration_evicts_down_when_max_memory_shrinks(tmp_path):
+    first = _define_sized(tmp_path, 350)
+    first("a")
+    first("b")
+    first("c")
+    assert first.cache.stats().current_bytes == 300
+
+    shrunk = _define_sized(tmp_path, 150)  # bound lowered between runs
+    assert shrunk.cache.stats().current_bytes <= 150
+
+
+def test_rehydration_ignores_other_namespaces(tmp_path):
+    other = _define_sized(tmp_path, 250, namespace="other.expensive")
+    other("x")
+    other("y")
+
+    mine = _define_sized(tmp_path, 250)
+    mine("a")
+    mine("b")  # my own budget is 250: two entries of mine must both fit
+    assert mine.cache.evictions == 0
+    assert mine.cache.stats().current_bytes == 200
+
+
+def test_rehydration_tolerates_entries_without_a_recorded_size(tmp_path):
+    """Entries written before max_memory existed carry size=None."""
+    unbounded = _define_sized(tmp_path, None)
+    unbounded("a")
+
+    bounded = _define_sized(tmp_path, 250)
+    assert bounded("b") == "b"  # decoration and use must not crash
+    assert bounded.cache.stats().current_bytes <= 250

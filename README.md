@@ -16,7 +16,9 @@ def expensive_analysis(df, config):
     ...
 ```
 
-> **Status: v0.2.0 — the core engine plus validated Numba Level A support** (236 tests): normalized keys with type-tagged hashing (incl. closure captures), native NumPy/pandas identity, `key=`/`ignore=` escape hatches, code-change invalidation, TTL, LRU memory bounds, atomic corruption-safe persistence, same-key single-flight, `stats()` with miss reasons and cold/warm JIT accounting, and `explain()`. Pre-1.0, so the API may still evolve. Next up: `depends_on=` dependency invalidation and `profile()` (see [ROADMAP](ROADMAP.md)).
+> **Status: v0.3.0 — the core engine plus validated Numba Level A support** (270 tests): normalized keys with type-tagged hashing (incl. closure captures), native NumPy/pandas identity, `key=`/`ignore=` escape hatches, code-change invalidation, TTL, LRU memory bounds that survive restarts, atomic corruption-safe persistence, same-key single-flight, `stats()` with miss reasons and cold/warm JIT accounting, and `explain()`. Pre-1.0, so the API may still evolve. Next up: `depends_on=` dependency invalidation and `profile()` (see [ROADMAP](ROADMAP.md)).
+>
+> **Upgrading from 0.2.x:** v0.3.0 fixes a fingerprint collision that could serve one function's result for another (a false HIT). Closing it changes how every function's identity is computed, so **existing persisted caches are invalidated once** — the first run after upgrading recomputes and reclaims the old files automatically. No action needed.
 
 ## Installation
 
@@ -143,6 +145,16 @@ Recommendation:  provide an explicit stable key or dataset version.
 ```
 
 Cachau doesn't just cache — it tells you when caching is a bad decision.
+
+## The persistent cache directory is a trust boundary
+
+Persisted values are serialized with `pickle`, so **reading** an entry deserializes whatever is on disk. Treat the cache directory the way you treat an importable Python file:
+
+- Keep it private to the user or service running the cache — the default `.cachau/` under your project is fine; `/tmp`, a world-writable share, or a volume mounted into a less-trusted container is not.
+- Never point `persist=` at a directory another user or process can write to. Writing there is equivalent to executing code inside your process on the next read.
+- Never ship or download a prepopulated cache directory as if it were data.
+
+Cachau treats damaged entries as a MISS (bad version, corrupt metadata, undecodable payload — the file is dropped and the value recomputed), but that is corruption handling, not a defense against a hostile writer.
 
 ## First-class Numba support
 

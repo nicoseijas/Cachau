@@ -257,3 +257,58 @@ def test_clear_removes_persisted_entries(tmp_path):
     assert list(tmp_path.glob("*.cachau"))
     expensive.cache.clear()
     assert not list(tmp_path.glob("*.cachau"))
+
+
+def test_wrong_typed_metadata_recomputes_instead_of_raising(tmp_path):
+    """Corruption degrades to a miss, never a mysterious error (issue #12)."""
+    import json
+
+    @cache(persist=str(tmp_path), namespace="corrupt.expensive")
+    def expensive(x):
+        return x * 2
+
+    assert expensive(3) == 6
+    (path,) = list(tmp_path.glob("*.cachau"))
+    content = path.read_bytes()
+    first_nl = content.index(b"\n")
+    second_nl = content.index(b"\n", first_nl + 1)
+    metadata = json.loads(content[first_nl + 1 : second_nl])
+    metadata["expires_at"] = "bad"
+    path.write_bytes(
+        content[: first_nl + 1] + json.dumps(metadata).encode() + content[second_nl:]
+    )
+
+    assert expensive(3) == 6  # recomputed, no TypeError
+    assert expensive.cache.stats().misses == 2
+
+
+def test_decoration_reads_each_entry_header_once(tmp_path, monkeypatch):
+    """Purge and budget rehydration must share one pass over the store.
+
+    Decoration happens at import; every extra pass is another round of file
+    opens over the whole cache directory.
+    """
+    import cachau.disk as disk
+
+    original = disk._read_metadata
+    reads = []
+
+    def counting(path):
+        reads.append(path)
+        return original(path)
+
+    @cache(persist=str(tmp_path), max_memory="10MB", namespace="scan.expensive")
+    def expensive(x):
+        return x
+
+    for i in range(20):
+        expensive(i)
+
+    monkeypatch.setattr(disk, "_read_metadata", counting)
+
+    @cache(persist=str(tmp_path), max_memory="10MB", namespace="scan.expensive")
+    def redecorated(x):
+        return x
+
+    assert len(reads) == 20
+    assert len(set(reads)) == 20

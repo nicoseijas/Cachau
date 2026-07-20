@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from cachau.backend import CacheEntry
 from cachau.disk import FORMAT_VERSION, DiskBackend
 
@@ -147,3 +149,84 @@ def test_format_version_recorded_in_header(tmp_path):
     meta = json.loads(content[first_nl + 1 : second_nl])
     assert meta["key"] == "k"
     assert meta["serializer"] == "pickle"
+
+
+# --- Wrong-typed but parseable metadata (issue #12) -------------------------
+#
+# A header can be valid JSON and still be nonsense. If the bad value survives
+# the read, it detonates later (e.g. inside is_expired) as an unrelated
+# TypeError in user code — the "mysterious error" the README rules out.
+
+
+def rewrite_metadata(path, **overrides):
+    content = path.read_bytes()
+    first_nl = content.index(b"\n")
+    second_nl = content.index(b"\n", first_nl + 1)
+    metadata = json.loads(content[first_nl + 1 : second_nl])
+    metadata.update(overrides)
+    path.write_bytes(
+        content[: first_nl + 1] + json.dumps(metadata).encode() + content[second_nl:]
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"expires_at": "bad"},
+        {"expires_at": []},
+        {"created_at": "bad"},
+        {"created_at": None},
+        {"size": "big"},
+        {"namespace": 7},
+        {"key": 7},
+    ],
+    ids=lambda o: "-".join(o),
+)
+def test_wrong_typed_metadata_degrades_to_miss(tmp_path, overrides):
+    backend = DiskBackend(tmp_path)
+    backend.set("k", entry(1, created_at=5.0, expires_at=65.0, size=10))
+    (path,) = list(tmp_path.glob("*.cachau"))
+    rewrite_metadata(path, **overrides)
+    assert backend.get("k") is None
+    assert not list(tmp_path.glob("*.cachau"))  # corrupt file removed
+
+
+def test_missing_metadata_field_degrades_to_miss(tmp_path):
+    backend = DiskBackend(tmp_path)
+    backend.set("k", entry(1))
+    (path,) = list(tmp_path.glob("*.cachau"))
+    content = path.read_bytes()
+    first_nl = content.index(b"\n")
+    second_nl = content.index(b"\n", first_nl + 1)
+    path.write_bytes(content[: first_nl + 1] + b'{"key": "k"}' + content[second_nl:])
+    assert backend.get("k") is None
+
+
+def test_integer_timestamps_are_accepted(tmp_path):
+    """JSON has one number type: an int timestamp is valid, not corruption."""
+    backend = DiskBackend(tmp_path)
+    backend.set("k", entry(1, created_at=5.0, expires_at=65.0, size=10))
+    (path,) = list(tmp_path.glob("*.cachau"))
+    rewrite_metadata(path, created_at=5, expires_at=65)
+    stored = backend.get("k")
+    assert stored is not None
+    assert stored.expires_at == 65
+
+
+def test_null_expiry_and_size_remain_valid(tmp_path):
+    backend = DiskBackend(tmp_path)
+    backend.set("k", entry(1, expires_at=None, size=None))
+    stored = backend.get("k")
+    assert stored is not None
+    assert stored.expires_at is None
+    assert stored.size is None
+
+
+def test_peek_leaves_wrong_typed_metadata_on_disk(tmp_path):
+    """Observation never mutates: peek() must not delete the corrupt file."""
+    backend = DiskBackend(tmp_path)
+    backend.set("k", entry(1))
+    (path,) = list(tmp_path.glob("*.cachau"))
+    rewrite_metadata(path, expires_at="bad")
+    assert backend.peek("k") is None
+    assert path.exists()

@@ -1,6 +1,8 @@
 """Observability: stats(), miss reasons, per-call invalidation (GUIDELINES.md §8)."""
 
 import dataclasses
+import sys
+import threading
 
 import pytest
 
@@ -339,3 +341,112 @@ def test_counters_survive_expired_and_eviction_flows():
     assert stats.evictions == 1
     assert stats.miss_expired == 1
     assert stats.writes == 3
+
+
+# --- Counter thread-safety (issue #15) --------------------------------------
+#
+# Single-flight only serializes callers of the SAME key, so flights for
+# different keys mutate the tallies concurrently — and `+=` on an attribute
+# is not atomic even under the GIL (it is LOAD / ADD / STORE). Lost
+# increments never corrupt a cached value, but they do corrupt observability.
+
+
+def _hammer_counters(threads=8, rounds=400, keys=16):
+    @cache
+    def expensive(x):
+        return x
+
+    switch_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # force preemption inside the read-modify-write
+    barrier = threading.Barrier(threads)
+
+    def worker():
+        barrier.wait()
+        for i in range(rounds):
+            expensive(i % keys)
+
+    try:
+        workers = [threading.Thread(target=worker) for _ in range(threads)]
+        for thread in workers:
+            thread.start()
+        for thread in workers:
+            thread.join()
+    finally:
+        sys.setswitchinterval(switch_interval)
+    return expensive.cache.stats(), threads * rounds
+
+
+def test_counters_do_not_lose_increments_under_concurrency():
+    stats, total_calls = _hammer_counters()
+    assert stats.hits + stats.misses == total_calls
+
+
+def test_miss_reasons_stay_consistent_under_concurrency():
+    stats, _ = _hammer_counters()
+    assert (
+        stats.miss_not_found + stats.miss_expired + stats.miss_invalidated
+        == stats.misses
+    )
+    assert stats.writes == stats.misses  # every miss commits exactly once
+
+
+def test_stats_never_holds_the_counter_lock_across_backend_io():
+    """The tallies lock must never be held across I/O, or a slow backend
+    stalls every concurrent call instead of just the observer."""
+    control_box = {}
+
+    class ProbingBackend(MemoryBackend):
+        def iter_metadata(self):
+            control = control_box.get("control")
+            if control is None:  # decoration-time purge, before cache exists
+                return super().iter_metadata()
+            acquired = control._counter_guard.acquire(blocking=False)
+            if acquired:
+                control._counter_guard.release()
+            control_box["free_during_io"] = acquired
+            return super().iter_metadata()
+
+    @cache(backend=ProbingBackend())
+    def expensive(x):
+        return x
+
+    control_box["control"] = expensive.cache
+    expensive(1)
+    expensive.cache.stats()
+    assert control_box["free_during_io"] is True
+
+
+def test_stats_snapshot_is_internally_consistent():
+    stats, total_calls = _hammer_counters()
+    assert stats.hits + stats.misses == total_calls
+    expected_rate = stats.hits / (stats.hits + stats.misses)
+    assert stats.hit_rate == expected_rate
+
+
+def test_every_bump_target_is_a_declared_tally():
+    """`_bump` is stringly-typed: a rename would break it silently at runtime,
+    invisible to any type checker. This is the check that isn't."""
+    import ast
+    import inspect
+
+    import cachau.decorator as decorator
+
+    tree = ast.parse(inspect.getsource(decorator))
+    targets = {
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_bump"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    }
+    assert targets, "no _bump call sites found — did the helper get renamed?"
+    assert targets <= set(decorator.TALLY_NAMES)
+
+    @cache
+    def expensive(x):
+        return x
+
+    for name in decorator.TALLY_NAMES:
+        assert hasattr(expensive.cache, name)
