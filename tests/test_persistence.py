@@ -312,3 +312,77 @@ def test_decoration_reads_each_entry_header_once(tmp_path, monkeypatch):
 
     assert len(reads) == 20
     assert len(set(reads)) == 20
+
+
+class _CountingHandle:
+    """File handle proxy that records how many bytes are actually delivered."""
+
+    def __init__(self, handle, tally):
+        self._handle = handle
+        self._tally = tally
+
+    def read(self, *args):
+        data = self._handle.read(*args)
+        self._tally.append(len(data))
+        return data
+
+    def __getattr__(self, name):
+        return getattr(self._handle, name)
+
+    def __enter__(self):
+        self._handle.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._handle.__exit__(*exc)
+
+
+def test_decoration_does_not_read_payload_bytes(tmp_path, monkeypatch):
+    """The metadata pass must read headers, not bodies.
+
+    Decoration scans the whole cache directory, and it happens at import. If
+    that scan reads each file in full, its cost scales with the SIZE of what
+    is cached rather than the NUMBER of entries: 1,000 x 1 MB entries would
+    pull 1 GB off disk before the program does any work of its own. Only the
+    two header lines are needed to purge and to rebuild the LRU budget.
+    """
+    import pathlib
+
+    payload_bytes = 1_000_000
+    entries = 5
+
+    @cache(persist=str(tmp_path), namespace="payload.expensive")
+    def expensive(x):
+        return b"x" * payload_bytes
+
+    for i in range(entries):
+        expensive(i)
+
+    delivered: list[int] = []
+    original_open = pathlib.Path.open
+    original_read_bytes = pathlib.Path.read_bytes
+
+    def counting_open(self, mode="r", *args, **kwargs):
+        handle = original_open(self, mode, *args, **kwargs)
+        if self.suffix == ".cachau":
+            return _CountingHandle(handle, delivered)
+        return handle
+
+    def counting_read_bytes(self, *args, **kwargs):
+        data = original_read_bytes(self, *args, **kwargs)
+        if self.suffix == ".cachau":
+            delivered.append(len(data))
+        return data
+
+    monkeypatch.setattr(pathlib.Path, "open", counting_open)
+    monkeypatch.setattr(pathlib.Path, "read_bytes", counting_read_bytes)
+
+    @cache(persist=str(tmp_path), max_memory="10MB", namespace="payload.expensive")
+    def redecorated(x):
+        return b""
+
+    total = sum(delivered)
+    assert total < 64 * 1024, (
+        f"decoration read {total:,} bytes for {entries} entries whose payloads "
+        f"total {entries * payload_bytes:,} — it is reading the bodies"
+    )
