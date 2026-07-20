@@ -141,10 +141,15 @@ class DiskBackend:
             if metadata is not None:
                 key = metadata.get("key")
                 namespace = metadata.get("namespace")
-                size = metadata.get("size")
                 if isinstance(key, str) and isinstance(namespace, str):
+                    # Unreadable numbers degrade to None rather than dropping
+                    # the row: a metadata-only consumer (stale purges) must
+                    # still see — and be able to reclaim — a damaged entry.
                     yield EntryMetadata(
-                        key, namespace, size if isinstance(size, int) else None
+                        key,
+                        namespace,
+                        _optional_number(metadata.get("size"), int),
+                        _optional_number(metadata.get("created_at"), float),
                     )
 
 
@@ -168,6 +173,64 @@ def _read_metadata(path: pathlib.Path) -> dict[str, Any] | None:
         return None
 
 
+def _checked_str(metadata: dict[str, Any], field: str) -> str:
+    value = metadata[field]
+    if not isinstance(value, str):
+        raise ValueError(f"{field} is not a string: {value!r}")
+    return value
+
+
+def _checked_timestamp(
+    metadata: dict[str, Any], field: str, *, optional: bool
+) -> float | None:
+    value = metadata[field]
+    if value is None and optional:
+        return None
+    # bool is a subclass of int: a JSON `true` here is corruption, not a time.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} is not a timestamp: {value!r}")
+    return float(value)  # JSON has one number type; an int is a valid instant
+
+
+def _checked_size(metadata: dict[str, Any], field: str) -> int | None:
+    value = metadata[field]
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} is not a byte count: {value!r}")
+    return value
+
+
+def _optional_number(value: Any, kind: type) -> Any:
+    """Coerce a metadata number, or None if it is absent or not a number."""
+    # bool is a subclass of int and never a legitimate size or timestamp.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if kind is int and not isinstance(value, int):
+        return None
+    return kind(value)
+
+
+def _entry_from_metadata(
+    metadata: dict[str, Any], value: Any
+) -> tuple[str, CacheEntry]:
+    """Build a validated entry, or raise so the caller degrades to a MISS.
+
+    A header can be syntactically valid JSON and still be nonsense. Without
+    this check the bad value survives the read and detonates later — a
+    wrong-typed ``expires_at`` raises inside ``is_expired``, surfacing as an
+    unrelated TypeError in user code. Validating here keeps corruption inside
+    the one place that already knows how to answer it: a controlled MISS.
+    """
+    return _checked_str(metadata, "key"), CacheEntry(
+        value=value,
+        namespace=_checked_str(metadata, "namespace"),
+        created_at=_checked_timestamp(metadata, "created_at", optional=False),
+        expires_at=_checked_timestamp(metadata, "expires_at", optional=True),
+        size=_checked_size(metadata, "size"),
+    )
+
+
 def _read_entry(
     path: pathlib.Path, *, remove_corrupt: bool = True
 ) -> tuple[str, CacheEntry] | None:
@@ -179,14 +242,7 @@ def _read_entry(
     try:
         metadata, payload = _split_file(content)
         value = pickle.loads(payload)
-        entry = CacheEntry(
-            value=value,
-            namespace=metadata["namespace"],
-            created_at=metadata["created_at"],
-            expires_at=metadata["expires_at"],
-            size=metadata["size"],
-        )
-        return metadata["key"], entry
+        return _entry_from_metadata(metadata, value)
     except Exception:  # noqa: BLE001 - any corruption degrades to a controlled miss
         if remove_corrupt:
             path.unlink(missing_ok=True)

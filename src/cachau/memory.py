@@ -43,4 +43,4 @@ class MemoryBackend:
 
     def iter_metadata(self) -> Iterator[EntryMetadata]:
         for key, entry in list(self._entries.items()):
-            yield EntryMetadata(key, entry.namespace, entry.size)
+            yield EntryMetadata(key, entry.namespace, entry.size, entry.created_at)

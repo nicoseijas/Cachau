@@ -18,6 +18,10 @@ class EntryMetadata(NamedTuple):
     key: str
     namespace: str
     size: int | None
+    # Creation instant, when the backend records one. The only ordering a
+    # store preserves across restarts: real LRU recency is process-local and
+    # dies with the process, so rehydration falls back to age.
+    created_at: float | None = None
 
 
 @dataclass(frozen=True)
