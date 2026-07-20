@@ -13,7 +13,7 @@ python benchmarks/bench_decoration.py
 
 - Warm up first; report the **median** of repeated runs (robust to scheduler noise).
 - Microsecond-scale operations are **batched**: each sample runs the operation enough times to last at least 5 ms, then divides. Timing a single 7 µs cache hit measures the scheduler, not the code — it moved by 2× between runs before this was fixed.
-- One-time costs — JIT compilation, first-touch faults — are measured **separately and labeled**, never averaged into steady-state numbers (GUIDELINES.md §14).
+- One-time costs — JIT compilation, first-touch faults, the import-time cache scan — are measured **separately and labeled**, never averaged into steady-state numbers (GUIDELINES.md §14). Where an operation only ever happens once per process, warming up measures the wrong thing: see [decoration cost](#decoration-cost-of-persist), where the discarded warmup run was 33× the median that followed it.
 - Each script prints its environment header. Numbers below are from one machine and one run; treat them as orders of magnitude, not contracts.
 
 Reference environment: Python 3.13.3, Windows 11, NumPy 2.3.1, pandas 2.3.0, Numba 0.66.0, cachau 0.3.2.
@@ -72,23 +72,28 @@ Pairwise-energy kernel (1,500 × 3 points), methodology *compile → warm up →
 
 Decorating a persistent cache scans the store once: it purges entries left by superseded versions of the function and — since 0.3.0 — rebuilds the LRU budget so `max_memory` still holds after a restart. This is paid at **import**, before the program does any work of its own, so it gets its own number.
 
-| Store | Decoration cost |
-|---|---:|
-| 10 entries | 0.8 ms |
-| 100 entries | 6.8 ms |
-| 1,000 entries | 61.4 ms |
-| 5,000 entries | 330.7 ms |
+Decoration happens **once per process**, against a directory the OS has not read yet, so the honest number is the *cold* one. Warming up and taking a median — the right method everywhere else on this page — reports the wrong thing here by construction: the discarded warmup run is the only one that resembles a real import, and every later run re-reads a directory the OS now has cached. The gap is 33×, so both columns are shown.
 
-Roughly 65 µs per entry, linear in the **number** of entries. Rebuilding the LRU budget is not what costs: on 1,000 entries, `persist=` alone took 71.0 ms and `persist=` + `max_memory=` took 71.6 ms. The scan itself dominates, and purge and rehydration share a single pass over it.
+| Store (1 KB entries) | Cold — what an import pays | Warm re-scan |
+|---|---:|---:|
+| 100 entries | 414.5 ms | 6.7 ms |
+| 500 entries | 2.12 s | 35.2 ms |
+| 2,000 entries | 8.15 s | 123.8 ms |
 
-Decoration must not scale with the **size** of what is cached, only with how many things are cached:
+**≈4.1 ms per entry, cold**, linear in the number of entries — and dominated by per-file open latency on this machine (Windows 11 with Defender active), not by bytes read. Expect a different constant on Linux or with the directory excluded from AV scanning; the linearity is what transfers.
 
-| 1,000 entries of | Decoration cost |
-|---|---:|
-| 1 KB | 65.0 ms |
-| 64 KB | 58.8 ms |
-| 1 MB | 60.4 ms |
+Rebuilding the LRU budget is not what costs: over 500 entries, `persist=` alone took 2.03 s and `persist=` + `max_memory=` took 1.98 s (the difference is noise). Purge and rehydration share a single pass.
 
-That flatness is recent. Through 0.3.1 the metadata scan read each file in full and discarded the body, so the 1 MB row cost **519.8 ms** — a cache holding 1,000 × 1 MB results moved a gigabyte through memory at import. 0.3.2 reads only the two header lines (`test_decoration_does_not_read_payload_bytes` holds the line at 64 KB total for 5 MB of payloads).
+Decoration must scale with how many things are cached, never with their size:
 
-**Reading:** with `persist=`, keep an eye on entry count, not cache size. A store with 100,000 entries adds several seconds to every import; that is what `max_memory=` and `ttl=` are for.
+| 300 entries of | Cold | Warm re-scan |
+|---|---:|---:|
+| 1 KB | 1.20 s | 18.2 ms |
+| 64 KB | 1.90 s | 16.8 ms |
+| 1 MB | 1.16 s | 18.7 ms |
+
+Through 0.3.1 the scan read each file in full and discarded the body, so a cache holding 1,000 × 1 MB results moved a gigabyte through memory at import. 0.3.2 reads only the two header lines; `test_decoration_does_not_read_payload_bytes` holds the line at 64 KB read for 5 MB of payloads.
+
+How much that fix buys depends on whether opening the file is cheaper than reading it. Warm, where opens are already cached, 300 × 1 MB went from 519.8 ms to 60.4 ms. Cold on this machine, where each open costs ~4 ms regardless, the same comparison is **1392 ms → 1181 ms, about 15%**. The earlier 8.6× figure was a warm-cache measurement and overstated it. What the fix guarantees unconditionally is that the scan's cost and memory use stop tracking payload size at all.
+
+**Reading:** with `persist=`, watch entry count, not cache size. A store with 20,000 entries can add a minute to every import on Windows. That is what `max_memory=` and `ttl=` are for.
