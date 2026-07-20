@@ -188,8 +188,14 @@ Not Redis, not a distributed cache, not a workflow engine, not an artifact regis
 
 > *A pleasant, robust function cache for expensive Python data workloads.*
 
+## Cache economics, measured
+
+Caching has a cost — keying, lookup, deserialization — and cachau refuses to pretend otherwise. [BENCHMARKS.md](BENCHMARKS.md) has the numbers (reproducible via [`benchmarks/`](benchmarks/)): a memory HIT on a 50 ms function is a ~6,500× win with scalar args and ~12× with an 8 MB array arg — while caching a 200 ns function with an 80 MB argument is a ~200,000× **loss**. Measure, don't assume.
+
 ## Documentation
 
+- **[examples/](examples/)** — four runnable scripts: quickstart with persistence, pandas workflows (`ignore=`/`key=`), observability (miss reasons, `explain()`), and Numba workloads with honest JIT metrics
+- **[BENCHMARKS.md](BENCHMARKS.md)** — measured keying costs, hit-vs-recompute economics, cold/warm JIT — with methodology
 - **[VISION.md](VISION.md)** — why Cachau exists, positioning, and guiding maxims
 - **[ROADMAP.md](ROADMAP.md)** — phased plan from foundations to Numba Level B
 - **[GUIDELINES.md](GUIDELINES.md)** — the full design & engineering spec (API, cache identity, TTL, eviction, persistence, invalidation, observability, concurrency, Numba, testing)
