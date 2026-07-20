@@ -106,11 +106,31 @@ jobs:
           python -m venv /tmp/verify
           /tmp/verify/bin/pip install -q dist/*.whl
           /tmp/verify/bin/python -c "
+          import pathlib
           import cachau
           @cachau.cache
           def f(x):
               return x * 2
           assert f(3) == 6 and f(3) == 6
           assert f.cache.stats().hits == 1
+          # PEP 561: without this marker every downstream type checker treats
+          # the package as untyped and silently infers Any, no matter how
+          # completely it is annotated. It has to be checked on the INSTALLED
+          # package — a source-tree check would miss a packaging regression.
+          assert (pathlib.Path(cachau.__file__).parent / 'py.typed').is_file(), 'py.typed missing from the wheel'
           print('smoke OK', cachau.__version__)
           "
+      - name: Type checkers see the annotations
+        run: |
+          /tmp/verify/bin/pip install -q mypy
+          cat > /tmp/typed_check.py <<'PY'
+          from cachau import cache
+
+          @cache(ttl="1h")
+          def f(x: int) -> int:
+              return x * 2
+
+          reveal_type(f)
+          PY
+          /tmp/verify/bin/python -m mypy /tmp/typed_check.py | tee /tmp/mypy.out
+          grep -q 'Revealed type is "def (x: int) -> int"' /tmp/mypy.out
