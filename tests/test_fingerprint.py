@@ -211,7 +211,16 @@ def test_numeric_constants_do_not_collide_across_boundaries():
     def g(x):
         return x + 12 + 3
 
-    assert f.__code__.co_code == g.__code__.co_code  # the premise of the bug
+    # The premise of the bug is version-dependent. Up to 3.13 the literals
+    # live in co_consts and the bytecode is byte-identical, which is exactly
+    # what made the collision reachable. 3.14 encodes small ints in the
+    # instruction itself, so the two bodies no longer share bytecode there
+    # (their co_code differs precisely at the operands 1/12 and 23/3) and this
+    # particular collision is unreachable. Larger constants, floats and strings
+    # still go through co_consts on every version — the fingerprints must
+    # differ either way, which is what the assertion below actually protects.
+    if sys.version_info < (3, 14):
+        assert f.__code__.co_code == g.__code__.co_code
     assert function_fingerprint(f) != function_fingerprint(g)
 
 

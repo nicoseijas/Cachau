@@ -92,9 +92,10 @@ def test_dataclass_identity_includes_module():
     class Config:
         name: str
 
-    foreign = dataclasses.make_dataclass(
-        "Config", [("name", str)], frozen=True, module="somewhere.else"
-    )
+    # make_dataclass(module=...) only exists on 3.12+; assigning __module__
+    # afterwards is what it does internally and keeps the test on 3.10/3.11.
+    foreign = dataclasses.make_dataclass("Config", [("name", str)], frozen=True)
+    foreign.__module__ = "somewhere.else"
     assert digest_arguments(sample, (Config("x"),), {}) != digest_arguments(
         sample, (foreign("x"),), {}
     )
