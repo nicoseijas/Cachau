@@ -57,7 +57,7 @@ Goal: the four-keyword experience, correct and observable.
 - [x] Coexistence with Numba `cache=True` (compilation cache ⊥ result cache)
 - [x] `parallel=True` and `fastmath` supported; changing a semantic option invalidates persisted stale results
 - [x] Persistence, TTL, memory limits, metrics, invalidation all working for Numba workloads
-- [x] Cold/warm JIT distinction in metrics, per specialization (a new-dtype compile on a later call is cold, never folded into savings baselines); dedicated benchmark suite remains a V1.1 item
+- [x] Cold/warm JIT distinction in metrics, per specialization (a new-dtype compile on a later call is cold, never folded into savings baselines) and in the benchmark suite
 
 **Stretch goal**
 
@@ -73,7 +73,7 @@ Goal: deepen the differentiators.
 - [ ] Polars hashing support
 - [ ] Richer `explain()`: eviction history, dependency fingerprint diffs
 - [ ] Notebook polish: cell re-runs never destroy useful persistent caches; code changes invalidate understandably
-- [ ] Benchmark suite with honest methodology (compile → warm up → benchmark; cold JIT reported separately)
+- [x] Benchmark suite with honest methodology (compile → warm up → benchmark; cold JIT reported separately) — see [BENCHMARKS.md](BENCHMARKS.md) and `benchmarks/`
 
 ## Phase 3 — V2: Numba Level B and hardening
 
