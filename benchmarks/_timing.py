@@ -14,17 +14,46 @@ import time
 from typing import Any, Callable
 
 
+# A sample must last long enough that timer granularity and scheduler noise
+# are a rounding error rather than the measurement. At ~7 µs per call, timing
+# one call at a time measures the OS; batching until the sample clears this
+# floor measures the code.
+_MIN_SAMPLE_SECONDS = 0.005
+
+
+def _calibrate(fn: Callable[[], Any]) -> int:
+    """Smallest power-of-two batch whose runtime clears the noise floor."""
+    batch = 1
+    while batch < 1 << 20:
+        start = time.perf_counter()
+        for _ in range(batch):
+            fn()
+        if time.perf_counter() - start >= _MIN_SAMPLE_SECONDS:
+            return batch
+        batch *= 2
+    return batch
+
+
 def measure(
-    fn: Callable[[], Any], *, repeats: int = 9, warmup: int = 2
+    fn: Callable[[], Any], *, repeats: int = 9, warmup: int = 2, batch: int | None = None
 ) -> float:
-    """Median wall-clock seconds of ``fn()`` after ``warmup`` discarded runs."""
+    """Median wall-clock seconds of ONE ``fn()`` after ``warmup`` discarded runs.
+
+    Each sample runs ``fn`` ``batch`` times and divides, because a single
+    microsecond-scale call is below the noise floor of the wall clock: timing
+    one 7 µs cache hit at a time reports whatever the scheduler did, and moves
+    by 2x between runs. ``batch`` is calibrated automatically unless pinned.
+    """
     for _ in range(warmup):
         fn()
+    if batch is None:
+        batch = _calibrate(fn)
     samples = []
     for _ in range(repeats):
         start = time.perf_counter()
-        fn()
-        samples.append(time.perf_counter() - start)
+        for _ in range(batch):
+            fn()
+        samples.append((time.perf_counter() - start) / batch)
     return statistics.median(samples)
 
 
