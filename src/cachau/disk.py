@@ -153,21 +153,49 @@ class DiskBackend:
                     )
 
 
-def _split_file(content: bytes) -> tuple[dict[str, Any], bytes]:
-    """Split raw file bytes into (metadata, payload); raises on any mismatch."""
-    first_nl = content.index(b"\n")
-    magic = content[:first_nl]
+# Header lines are a magic string plus a small JSON object, so a single
+# modest read covers them. The loop below still grows if a pathological key
+# makes the header longer, and gives up rather than reading an entire large
+# payload looking for a newline that corruption removed.
+_HEADER_CHUNK = 8 * 1024
+_HEADER_LIMIT = 1024 * 1024
+
+
+def _parse_header(prefix: bytes) -> tuple[dict[str, Any], int]:
+    """Parse the two header lines; return the metadata and the payload offset."""
+    first_nl = prefix.index(b"\n")
+    magic = prefix[:first_nl]
     if magic != _MAGIC_PREFIX + str(FORMAT_VERSION).encode():
         raise ValueError(f"unknown format: {magic!r}")
-    second_nl = content.index(b"\n", first_nl + 1)
-    metadata: dict[str, Any] = json.loads(content[first_nl + 1 : second_nl])
-    return metadata, content[second_nl + 1 :]
+    second_nl = prefix.index(b"\n", first_nl + 1)
+    metadata: dict[str, Any] = json.loads(prefix[first_nl + 1 : second_nl])
+    return metadata, second_nl + 1
+
+
+def _split_file(content: bytes) -> tuple[dict[str, Any], bytes]:
+    """Split raw file bytes into (metadata, payload); raises on any mismatch."""
+    metadata, offset = _parse_header(content)
+    return metadata, content[offset:]
 
 
 def _read_metadata(path: pathlib.Path) -> dict[str, Any] | None:
-    """Header-only read: never deserializes the payload."""
+    """Read only the header, never the payload.
+
+    This runs for every entry in the directory on every decoration of a
+    persistent cache — that is, at import. Reading whole files here would make
+    startup scale with the SIZE of what is cached instead of the NUMBER of
+    entries, so a cache holding 1,000 x 1 MB results would move a gigabyte
+    through memory before the program did any work of its own.
+    """
     try:
-        metadata, _ = _split_file(path.read_bytes())
+        with path.open("rb") as handle:
+            prefix = b""
+            while prefix.count(b"\n") < 2 and len(prefix) < _HEADER_LIMIT:
+                chunk = handle.read(_HEADER_CHUNK)
+                if not chunk:
+                    break
+                prefix += chunk
+        metadata, _ = _parse_header(prefix)
         return metadata
     except Exception:  # noqa: BLE001 - any corruption degrades to a controlled miss
         return None
