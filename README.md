@@ -16,7 +16,7 @@ def expensive_analysis(df, config):
     ...
 ```
 
-> **Status: v0.3.2 — the core engine plus validated Numba Level A support** (324 tests, CI on 3.10-3.13 plus free-threaded 3.13t/3.14t): normalized keys with type-tagged hashing (incl. closure captures), native NumPy/pandas identity, `key=`/`ignore=` escape hatches, code-change invalidation, TTL, LRU memory bounds that survive restarts, atomic corruption-safe persistence, same-key single-flight, `stats()` with miss reasons and cold/warm JIT accounting, `explain()`, `depends_on=` external-dependency invalidation (files, env vars, package versions, custom tokens), and `profile()` (measured cache economics). Pre-1.0, so the API may still evolve. Next up: `inspect()` and Polars hashing (see [ROADMAP](ROADMAP.md)).
+> **Status: v0.3.2 — the core engine plus validated Numba Level A support** (339 tests, CI on 3.10-3.13 plus free-threaded 3.13t/3.14t): normalized keys with type-tagged hashing (incl. closure captures), native NumPy/pandas identity, `key=`/`ignore=` escape hatches, code-change invalidation, TTL, LRU memory bounds that survive restarts, atomic corruption-safe persistence, same-key single-flight, `stats()` with miss reasons and cold/warm JIT accounting, `explain()` (with eviction and dependency-diff detail), `inspect()`, `depends_on=` external-dependency invalidation (files, env vars, package versions, custom tokens), and `profile()` (measured cache economics). Pre-1.0, so the API may still evolve. Next up: Polars hashing (see [ROADMAP](ROADMAP.md)).
 >
 > **Upgrading from 0.2.x:** v0.3.x fixes a fingerprint collision that could serve one function's result for another (a false HIT). Closing it changes how every function's identity is computed, so **existing persisted caches are invalidated once** — the first run after upgrading recomputes and reclaims the old files automatically. No action needed.
 
@@ -126,6 +126,7 @@ build_features.cache.stats()        # hits, misses, hit rate, miss reasons, byte
                                     # cold-JIT time — as an immutable snapshot
 build_features.cache.clear()
 build_features.cache.invalidate(df, config)
+build_features.cache.inspect()               # browse the cached entries
 build_features.cache.explain(df, config)     # pure observation, never recomputes
 build_features.cache.profile(df, config)     # measures: is caching worth it?
 ```
@@ -141,16 +142,32 @@ Expired:     3m 2s ago (at 2026-07-19 15:03:11 UTC)
 Size:        1.2 MB
 ```
 
-With `depends_on=`, a changed dependency reports as its own reason and names the culprit:
+With `depends_on=`, a changed dependency reports as its own reason and shows exactly which one changed, before and after:
 
 ```
 MISS
 Reason:      dependency_changed
-Changed dep: env:PIPELINE_MODE
+Changed dep: env:PIPELINE_MODE (v:fast -> v:thorough)
 Namespace:   features.build_features
 Created:     2026-07-19 14:03:11 UTC
 Size:        1.2 MB
 ```
+
+An entry the LRU budget dropped reports `evicted` rather than `not_found`, so you can tell "never cached" from "cached, then pushed out".
+
+### `inspect()` — browse what's cached
+
+`inspect()` lists the entries a function currently holds — newest first, read from entry headers without deserializing any values, so it stays cheap over a large persistent cache:
+
+```
+3 cached entries for features.build_features (4.6 MB)
+
+  a1b2c3d4e5f60718  1.2 MB  age 3m   ttl 57m       deps env:PIPELINE_MODE
+  9f8e7d6c5b4a3021  2.1 MB  age 11m  ttl 49m       deps env:PIPELINE_MODE
+  0011223344556677  1.3 MB  age 2h   EXPIRED       deps env:PIPELINE_MODE
+```
+
+The result is a plain read-only sequence of `CacheEntryView` (indexable, iterable), each with `age_seconds`, `ttl_remaining_seconds`, `is_expired`, `size_bytes`, and `dependency_fingerprints` — natural to poke at in a notebook cell.
 
 ### `profile()` — is caching even worth it?
 

@@ -151,6 +151,8 @@ class DiskBackend:
                         namespace,
                         _optional_number(metadata.get("size"), int),
                         _optional_number(metadata.get("created_at"), float),
+                        _optional_number(metadata.get("expires_at"), float),
+                        _lenient_dependencies(metadata.get("dependency_fingerprints")),
                     )
 
 
@@ -247,6 +249,20 @@ def _checked_dependencies(metadata: dict[str, Any]) -> dict[str, str] | None:
     ):
         raise ValueError(f"dependency_fingerprints is not a str->str map: {value!r}")
     return value
+
+
+def _lenient_dependencies(value: Any) -> dict[str, str] | None:
+    """Coerce a metadata dependency map for observation, or None if malformed.
+
+    The read-path validator (``_checked_dependencies``) RAISES on a bad map so a
+    corrupt entry degrades to a MISS. A metadata scan (inspect/stats) must not
+    raise over one damaged row, so here a malformed value simply reads as None.
+    """
+    if isinstance(value, dict) and all(
+        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+    ):
+        return value
+    return None
 
 
 def _optional_number(value: Any, kind: type) -> Any:

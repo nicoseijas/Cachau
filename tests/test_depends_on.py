@@ -291,6 +291,38 @@ def test_explain_reports_dependency_changed_and_which(monkeypatch, tmp_path):
     assert "env:MODE" in str(explanation)
 
 
+def test_explain_dependency_diff_shows_before_and_after(monkeypatch, tmp_path):
+    data = tmp_path / "d.csv"
+    data.write_text("x")
+    monkeypatch.setenv("MODE", "a")
+
+    @cache(depends_on=[str(data), cachau.env("MODE")])
+    def run(n):
+        return n
+
+    run(1)
+    monkeypatch.setenv("MODE", "b")
+    explanation = run.cache.explain(1)
+    assert explanation.reason == "dependency_changed"
+    assert explanation.dependency_diff == {"env:MODE": ("v:a", "v:b")}
+    assert "env:MODE (v:a -> v:b)" in str(explanation)
+
+
+def test_explain_dependency_diff_marks_appearing_dependency(tmp_path):
+    data = tmp_path / "later.csv"  # absent at first
+
+    @cache(depends_on=[str(data)])
+    def run(n):
+        return n
+
+    run(1)  # committed against <absent>
+    data.write_text("now here")
+    diff = run.cache.explain(1).dependency_diff
+    (label, (before, after)) = next(iter(diff.items()))
+    assert before == "<absent>"
+    assert after != "<absent>"
+
+
 def test_explain_is_still_pure_with_dependencies(monkeypatch):
     monkeypatch.setenv("MODE", "a")
 

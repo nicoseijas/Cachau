@@ -22,6 +22,12 @@ class EntryMetadata(NamedTuple):
     # store preserves across restarts: real LRU recency is process-local and
     # dies with the process, so rehydration falls back to age.
     created_at: float | None = None
+    # Expiry instant and declared-dependency fingerprints, both readable from
+    # the entry header without deserializing the payload — so inspect() can show
+    # TTL and dependency state cheaply over a persistent cache. Optional so a
+    # third-party backend that only records key/namespace/size still conforms.
+    expires_at: float | None = None
+    dependency_fingerprints: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)

@@ -92,6 +92,34 @@ def test_pending_invalidation_is_never_explained_as_hit(monkeypatch):
     assert explanation.reason == "invalidated"
 
 
+def test_explain_reports_evicted():
+    calls = []
+
+    @cache(max_memory=250, size_of=lambda v: 100)
+    def expensive(x):
+        calls.append(x)
+        return x
+
+    expensive("a")
+    expensive("b")
+    expensive("c")  # evicts "a" (least recently used)
+    assert expensive.cache.explain("a").reason == "evicted"
+    assert expensive.cache.explain("never").reason == "not_found"
+
+
+def test_explain_evicted_becomes_found_after_recache():
+    @cache(max_memory=250, size_of=lambda v: 100)
+    def expensive(x):
+        return x
+
+    expensive("a")
+    expensive("b")
+    expensive("c")  # evicts "a"
+    assert expensive.cache.explain("a").reason == "evicted"
+    expensive("a")  # recompute — "a" is cached again
+    assert expensive.cache.explain("a").reason == "found"
+
+
 def test_explain_is_pure_it_does_not_touch_stats():
     @cache
     def expensive(x):
