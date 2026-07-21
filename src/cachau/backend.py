@@ -33,6 +33,11 @@ class CacheEntry:
     created_at: float = field(default_factory=time.time)
     expires_at: float | None = None
     size: int | None = None
+    # Fingerprints of the external dependencies declared via ``depends_on=`` at
+    # the moment this result was computed, keyed by dependency label. ``None``
+    # means the function declared no dependencies. Compared on read: a mismatch
+    # is a ``dependency_changed`` miss (GUIDELINES.md §7, §8).
+    dependency_fingerprints: dict[str, str] | None = None
 
     def is_expired(self, now: float) -> bool:
         return self.expires_at is not None and now >= self.expires_at

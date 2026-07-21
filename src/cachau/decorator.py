@@ -11,6 +11,12 @@ from collections import OrderedDict
 from typing import Any, Callable, Iterable, TypeVar, overload
 
 from cachau.backend import CacheBackend, CacheEntry, EntryMetadata
+from cachau.dependencies import (
+    LabeledDependency,
+    changed_labels,
+    fingerprint_dependencies,
+    normalize_dependencies,
+)
 from cachau.disk import DiskBackend
 from cachau.durations import parse_ttl
 from cachau.errors import ConfigurationError
@@ -51,9 +57,11 @@ TALLY_NAMES = (
     "miss_not_found",
     "miss_expired",
     "miss_invalidated",
+    "miss_dependency_changed",
     "writes",
     "evictions",
     "skipped_oversized",
+    "dependency_race_skips",
     "size_estimate_failures",
     "write_errors",
     "delete_errors",
@@ -81,6 +89,7 @@ class CacheControl:
         key_builder: KeyBuilder,
         now: Clock,
         flights: KeyedLocks,
+        dependencies: tuple[LabeledDependency, ...] = (),
         code_change_invalidations: int = 0,
         evictions: int = 0,
     ) -> None:
@@ -93,11 +102,13 @@ class CacheControl:
         self.miss_not_found = 0
         self.miss_expired = 0
         self.miss_invalidated = 0
+        self.miss_dependency_changed = 0
         self.writes = 0
         # Seeded: rehydrating the budget over a persistent store can already
         # have evicted, before the first call of this process.
         self.evictions = evictions
         self.skipped_oversized = 0
+        self.dependency_race_skips = 0
         self.size_estimate_failures = 0
         self.write_errors = 0
         self.delete_errors = 0
@@ -123,6 +134,7 @@ class CacheControl:
         self._key_builder = key_builder
         self._now = now
         self._flights = flights
+        self._dependencies = dependencies
         # Guards compound mutations of the invalidation bookkeeping, which is
         # function-wide state reachable from concurrent flights of different
         # keys. Never held across backend I/O or a computation.
@@ -170,8 +182,11 @@ class CacheControl:
     def explain(self, *args: Any, **kwargs: Any) -> Explanation:
         """Explain what a call with these arguments would do, and why.
 
-        Pure observation: never executes the function, never mutates cache
-        state, counters, invalidation bookkeeping, or LRU recency.
+        Pure observation: never executes the cached function, never mutates
+        cache state, counters, invalidation bookkeeping, or LRU recency. The one
+        caveat the user owns: if ``depends_on`` includes a ``token(callable)``,
+        checking whether a dependency changed evaluates that callable (as a real
+        call would), so a side-effecting or raising token is visible here too.
         """
         key = self._key_builder(*args, **kwargs)
         checked_at = self._now()
@@ -199,6 +214,17 @@ class CacheControl:
         }
         if entry.is_expired(checked_at):
             return Explanation(outcome="MISS", reason="expired", **common, **facts)
+        if self._dependencies:
+            current = fingerprint_dependencies(self._dependencies)
+            if entry.dependency_fingerprints != current:
+                changed = changed_labels(entry.dependency_fingerprints, current)
+                return Explanation(
+                    outcome="MISS",
+                    reason="dependency_changed",
+                    changed_dependencies=changed,
+                    **common,
+                    **facts,
+                )
         return Explanation(outcome="HIT", reason="found", **common, **facts)
 
     def clear(self) -> None:
@@ -252,7 +278,10 @@ class CacheControl:
         with self._counter_guard:
             tally = {name: getattr(self, name) for name in TALLY_NAMES}
         misses = (
-            tally["miss_not_found"] + tally["miss_expired"] + tally["miss_invalidated"]
+            tally["miss_not_found"]
+            + tally["miss_expired"]
+            + tally["miss_invalidated"]
+            + tally["miss_dependency_changed"]
         )
         total_calls = tally["hits"] + misses
         return CacheStats(
@@ -263,14 +292,17 @@ class CacheControl:
             miss_not_found=tally["miss_not_found"],
             miss_expired=tally["miss_expired"],
             miss_invalidated=tally["miss_invalidated"],
+            miss_dependency_changed=tally["miss_dependency_changed"],
             expirations=tally["miss_expired"],
             writes=tally["writes"],
             skipped_writes=(
                 tally["skipped_oversized"]
+                + tally["dependency_race_skips"]
                 + tally["size_estimate_failures"]
                 + tally["write_errors"]
             ),
             skipped_oversized=tally["skipped_oversized"],
+            dependency_race_skips=tally["dependency_race_skips"],
             size_estimate_failures=tally["size_estimate_failures"],
             write_errors=tally["write_errors"],
             delete_errors=tally["delete_errors"],
@@ -301,6 +333,7 @@ def cache(
     namespace: str | None = None,
     key: Callable[..., Any] | None = None,
     ignore: list[str] | tuple[str, ...] | None = None,
+    depends_on: list[Any] | tuple[Any, ...] | None = None,
     backend: CacheBackend | None = None,
     clock: Clock = ...,
     size_of: SizeOf = ...,
@@ -316,6 +349,7 @@ def cache(
     namespace: str | None = None,
     key: Callable[..., Any] | None = None,
     ignore: list[str] | tuple[str, ...] | None = None,
+    depends_on: list[Any] | tuple[Any, ...] | None = None,
     backend: CacheBackend | None = None,
     clock: Clock = time.time,
     size_of: SizeOf = estimate_size,
@@ -329,17 +363,21 @@ def cache(
     this function's entries with LRU eviction — an entry larger than the whole
     budget is computed and returned but never cached. ``persist=True`` stores
     entries under ``./.cachau`` (or pass a directory) and survives process
-    restarts; a failed write never loses the computed result. Exceptions are
-    never cached; unhashable arguments fail loudly. ``func.cache`` exposes
-    ``stats()``, ``clear()`` and ``invalidate(...)``.
+    restarts; a failed write never loses the computed result. ``depends_on``
+    declares external inputs — file paths, or ``cachau.file/env/package/token``
+    descriptors — that invalidate a result when they change (a ``dependency_
+    changed`` miss). Exceptions are never cached; unhashable arguments fail
+    loudly. ``func.cache`` exposes ``stats()``, ``clear()`` and
+    ``invalidate(...)``.
     """
     if func is not None:
         return _wrap(
-            func, ttl, max_memory, persist, namespace, key, ignore, backend,
-            clock, size_of,
+            func, ttl, max_memory, persist, namespace, key, ignore, depends_on,
+            backend, clock, size_of,
         )
     return lambda f: _wrap(
-        f, ttl, max_memory, persist, namespace, key, ignore, backend, clock, size_of
+        f, ttl, max_memory, persist, namespace, key, ignore, depends_on, backend,
+        clock, size_of,
     )
 
 
@@ -477,6 +515,7 @@ def _wrap(
     namespace: str | None,
     key: Callable[..., Any] | None,
     ignore: list[str] | tuple[str, ...] | None,
+    depends_on: list[Any] | tuple[Any, ...] | None,
     backend: CacheBackend | None,
     clock: Clock,
     size_of: SizeOf,
@@ -488,6 +527,7 @@ def _wrap(
             "defines the full identity, so there is nothing left to ignore"
         )
     ignored_names = _validate_ignore(func, ignore)
+    dependencies = normalize_dependencies(depends_on)
     ttl_seconds = parse_ttl(ttl)
     max_memory_bytes = parse_size(max_memory)
     resolved_namespace = namespace if namespace is not None else function_namespace(func)
@@ -537,6 +577,12 @@ def _wrap(
             digest = digest_arguments(func, args, kwargs, ignore=ignored_names)
         return f"{resolved_namespace}:{fingerprint}:{digest}"
 
+    def current_dependencies() -> dict[str, str] | None:
+        # One fingerprint pass per call, shared by the freshness check and the
+        # write, so a HIT and the value it might commit agree on exactly which
+        # dependency state the result reflects. ``None`` when none are declared.
+        return fingerprint_dependencies(dependencies)
+
     def safe_delete(key: str) -> None:
         # A backend delete can fail on disk (locked file, permissions). The
         # cache is an optimization: never let that block returning a value.
@@ -549,7 +595,8 @@ def _wrap(
 
     _NOT_SERVED = object()
 
-    def serve_if_fresh(key: str, *, coalesced: bool) -> Any:
+    def serve_if_fresh(key: str, dep_fingerprints: dict[str, str] | None, *,
+                       coalesced: bool) -> Any:
         """Serve a fresh entry with hit bookkeeping, or return _NOT_SERVED.
 
         Never classifies misses and never mutates entries — that belongs to
@@ -560,6 +607,11 @@ def _wrap(
             return _NOT_SERVED
         entry = store.get(key)
         if entry is None or entry.is_expired(now()):
+            return _NOT_SERVED
+        if dependencies and entry.dependency_fingerprints != dep_fingerprints:
+            # A declared dependency changed since this entry was committed:
+            # the stored result no longer reflects the current inputs. Not a
+            # HIT; the locked flight reclassifies and recomputes it.
             return _NOT_SERVED
         if key in control._pending_invalidations:
             # Re-check after the read: a concurrent invalidate whose physical
@@ -574,16 +626,19 @@ def _wrap(
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         key = build_key(*args, **kwargs)
-        served = serve_if_fresh(key, coalesced=False)
+        dep_fingerprints = current_dependencies()
+        served = serve_if_fresh(key, dep_fingerprints, coalesced=False)
         if served is not _NOT_SERVED:
             return served
         with flights.holding(key):
-            return _compute_flight(key, args, kwargs)
+            return _compute_flight(key, args, kwargs, dep_fingerprints)
 
-    def _compute_flight(key: str, args: tuple, kwargs: dict) -> Any:
+    def _compute_flight(
+        key: str, args: tuple, kwargs: dict, dep_fingerprints: dict[str, str] | None
+    ) -> Any:
         # Re-check under the per-key lock: another flight may have committed
         # while this caller was waiting — that is the single-flight reuse.
-        served = serve_if_fresh(key, coalesced=True)
+        served = serve_if_fresh(key, dep_fingerprints, coalesced=True)
         if served is not _NOT_SERVED:
             return served
         if key in control._pending_invalidations:
@@ -602,11 +657,16 @@ def _wrap(
         else:
             entry = store.get(key)
             if entry is not None:
-                # Fresh entries were served above; only expired ones reach here.
+                # Fresh, dependency-matching entries were served above; an entry
+                # that still exists here is either expired or has a stale
+                # dependency fingerprint. Attribute the miss to the right cause.
                 safe_delete(key)
                 if budget is not None:
                     budget.forget(key)
-                control._bump("miss_expired")
+                if entry.is_expired(now()):
+                    control._bump("miss_expired")
+                else:
+                    control._bump("miss_dependency_changed")
             else:
                 # Atomic pop: a concurrent clear() or marker-cap eviction must
                 # not turn check-then-delete into a KeyError.
@@ -639,6 +699,22 @@ def _wrap(
                 is_cold_jit = control.compute_count == 1
             if is_cold_jit:
                 control._bump("cold_compute_seconds", compute_elapsed)
+        if dependencies:
+            # A declared dependency may have moved WHILE func() ran. Re-observe
+            # after compute and refuse to cache if it changed: stamping the
+            # result with the pre-compute fingerprint would let a later call —
+            # back in the original state — serve it as fresh, a false HIT. This
+            # mirrors TTL's commit-time discipline (committed_at is "at commit,
+            # not at call start"). It closes the common case (a dependency
+            # rewritten mid-compute and left changed); it cannot close a change
+            # that reverts before commit (A→B→A), which the stability contract
+            # in dependencies.py excludes — cachau cannot see reads made inside
+            # func(). When stable, the snapshots match and nothing changes.
+            dep_after = current_dependencies()
+            if dep_after != dep_fingerprints:
+                control._bump("dependency_race_skips")
+                return value
+            dep_fingerprints = dep_after
         committed_at = now()  # TTL starts at commit, not at call start
         size: int | None = None
         if budget is not None:
@@ -672,6 +748,7 @@ def _wrap(
                         committed_at + ttl_seconds if ttl_seconds is not None else None
                     ),
                     size=size,
+                    dependency_fingerprints=dep_fingerprints,
                 ),
             )
             control._record_commit(None if is_cold_jit else compute_elapsed)
@@ -695,6 +772,7 @@ def _wrap(
         key_builder=build_key,
         now=peek_now,
         flights=flights,
+        dependencies=dependencies,
         code_change_invalidations=purged,
         evictions=rehydrated_evictions,
     )
