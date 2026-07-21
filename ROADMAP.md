@@ -38,7 +38,7 @@ Goal: the four-keyword experience, correct and observable.
 **Correctness & robustness**
 
 - [x] Invalidation on code change (function fingerprint, including on-disk reclamation)
-- [x] Miss reasons: `miss_not_found`, `miss_expired`, `miss_invalidated` per call; code-change invalidations reported at decoration (`miss_code_changed`/`miss_dependency_changed`/`miss_corrupt` as distinct per-call reasons arrive with `depends_on` in V1.1)
+- [x] Miss reasons: `miss_not_found`, `miss_expired`, `miss_invalidated`, `miss_dependency_changed` per call; code-change invalidations reported at decoration (`miss_code_changed`/`miss_corrupt` as distinct per-call reasons still pending)
 - [x] Safe fallback on corruption (degrade to miss, never mysterious errors)
 - [x] Serialization failure ⇒ return result, record `write_errors` (delete failures tracked separately)
 - [x] Exceptions not cached
@@ -47,7 +47,7 @@ Goal: the four-keyword experience, correct and observable.
 **Observability**
 
 - [x] Full `stats()`: hits (incl. coalesced), misses, hit rate, writes, skipped writes, expirations, invalidations, evictions, serde/delete errors, entry count, bytes, compute time, estimated time saved
-- [x] `func.cache.explain(...)` — HIT/MISS with reason, size, remaining TTL; strictly pure observation (changed-dependency answers arrive with `depends_on`)
+- [x] `func.cache.explain(...)` — HIT/MISS with reason, size, remaining TTL, and which declared dependency changed; strictly pure observation
 
 **Numba Level A (first-class)** ✅ validated
 
@@ -69,7 +69,7 @@ Goal: deepen the differentiators.
 
 - [ ] `cache.profile()` complete (if it didn't ship in V1): timing breakdown, net savings, primary-cost diagnosis, actionable recommendation
 - [ ] `func.cache.inspect()` — entry browsing
-- [ ] `depends_on=[...]` external dependency invalidation: files (mtime / size / content hash), environment variables, package versions, user-defined tokens
+- [x] `depends_on=[...]` external dependency invalidation: files (mtime / size / content hash), environment variables, package versions, user-defined tokens — declared via bare paths or `cachau.file/env/package/token`; fingerprints stored per-entry (read header-only), compared on read, surfaced as a distinct `miss_dependency_changed` reason and named in `explain()`
 - [ ] Polars hashing support
 - [ ] Richer `explain()`: eviction history, dependency fingerprint diffs
 - [ ] Notebook polish: cell re-runs never destroy useful persistent caches; code changes invalidate understandably

@@ -19,10 +19,15 @@ class CacheStats:
     miss_not_found: int
     miss_expired: int
     miss_invalidated: int
+    miss_dependency_changed: int
     expirations: int
     writes: int
     skipped_writes: int
     skipped_oversized: int
+    # Results whose declared dependencies changed while the function was running:
+    # returned to the caller but never cached, since no stable fingerprint
+    # describes them (would otherwise risk a false HIT). Counted in skipped_writes.
+    dependency_race_skips: int
     size_estimate_failures: int
     write_errors: int
     delete_errors: int

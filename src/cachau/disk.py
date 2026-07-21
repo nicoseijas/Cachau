@@ -71,6 +71,7 @@ class DiskBackend:
             "created_at": entry.created_at,
             "expires_at": entry.expires_at,
             "size": entry.size,
+            "dependency_fingerprints": entry.dependency_fingerprints,
             "serializer": _SERIALIZER,
         }
         header = (
@@ -229,6 +230,25 @@ def _checked_size(metadata: dict[str, Any], field: str) -> int | None:
     return value
 
 
+def _checked_dependencies(metadata: dict[str, Any]) -> dict[str, str] | None:
+    """Parse the stored dependency fingerprints, or raise so the read misses.
+
+    Absent (entries written before ``depends_on`` existed) degrades to ``None``
+    — backward compatible, and a function that now declares dependencies then
+    sees a mismatch and recomputes. A present-but-malformed value is corruption:
+    raise so the whole read degrades to a controlled MISS, never a silent
+    freshness check against garbage.
+    """
+    value = metadata.get("dependency_fingerprints")
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+    ):
+        raise ValueError(f"dependency_fingerprints is not a str->str map: {value!r}")
+    return value
+
+
 def _optional_number(value: Any, kind: type) -> Any:
     """Coerce a metadata number, or None if it is absent or not a number."""
     # bool is a subclass of int and never a legitimate size or timestamp.
@@ -256,6 +276,7 @@ def _entry_from_metadata(
         created_at=_checked_timestamp(metadata, "created_at", optional=False),
         expires_at=_checked_timestamp(metadata, "expires_at", optional=True),
         size=_checked_size(metadata, "size"),
+        dependency_fingerprints=_checked_dependencies(metadata),
     )
 
 

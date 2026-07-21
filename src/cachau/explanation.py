@@ -1,8 +1,11 @@
 """The answer returned by ``func.cache.explain(...)``.
 
-Explaining is pure observation: it never executes the function, never mutates
-cache state, never touches counters or LRU recency. The system should be
-invisible when it works and fully transparent when you need to understand it.
+Explaining is pure observation: it never executes the cached function, never
+mutates cache state, never touches counters or LRU recency. The one exception
+is a declared ``token(callable)`` dependency, which is evaluated to check for a
+change — the caveat the user owns (see ``CacheControl.explain``). The system
+should be invisible when it works and fully transparent when you need to
+understand it.
 """
 
 from __future__ import annotations
@@ -14,7 +17,8 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Explanation:
     outcome: str  # "HIT" | "MISS"
-    reason: str  # "found" | "not_found" | "expired" | "invalidated"
+    # "found" | "not_found" | "expired" | "invalidated" | "dependency_changed"
+    reason: str
     key: str
     namespace: str
     fingerprint: str
@@ -22,6 +26,8 @@ class Explanation:
     created_at: float | None = None
     expires_at: float | None = None
     size_bytes: int | None = None
+    # Which declared dependencies changed, when reason == "dependency_changed".
+    changed_dependencies: tuple[str, ...] | None = None
 
     @property
     def age_seconds(self) -> float | None:
@@ -43,6 +49,8 @@ class Explanation:
 
     def __str__(self) -> str:
         lines = [self.outcome, f"Reason:      {self.reason}"]
+        if self.changed_dependencies:
+            lines.append(f"Changed dep: {', '.join(self.changed_dependencies)}")
         lines.append(f"Namespace:   {self.namespace}")
         if self.created_at is not None:
             lines.append(f"Created:     {_format_timestamp(self.created_at)}")

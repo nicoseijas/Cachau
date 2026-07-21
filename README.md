@@ -16,7 +16,7 @@ def expensive_analysis(df, config):
     ...
 ```
 
-> **Status: v0.3.2 — the core engine plus validated Numba Level A support** (271 tests, CI on 3.10-3.13 plus free-threaded 3.13t/3.14t): normalized keys with type-tagged hashing (incl. closure captures), native NumPy/pandas identity, `key=`/`ignore=` escape hatches, code-change invalidation, TTL, LRU memory bounds that survive restarts, atomic corruption-safe persistence, same-key single-flight, `stats()` with miss reasons and cold/warm JIT accounting, and `explain()`. Pre-1.0, so the API may still evolve. Next up: `depends_on=` dependency invalidation and `profile()` (see [ROADMAP](ROADMAP.md)).
+> **Status: v0.3.2 — the core engine plus validated Numba Level A support** (305 tests, CI on 3.10-3.13 plus free-threaded 3.13t/3.14t): normalized keys with type-tagged hashing (incl. closure captures), native NumPy/pandas identity, `key=`/`ignore=` escape hatches, code-change invalidation, TTL, LRU memory bounds that survive restarts, atomic corruption-safe persistence, same-key single-flight, `stats()` with miss reasons and cold/warm JIT accounting, `explain()`, and `depends_on=` external-dependency invalidation (files, env vars, package versions, custom tokens). Pre-1.0, so the API may still evolve. Next up: `profile()` (is caching even worth it?) (see [ROADMAP](ROADMAP.md)).
 >
 > **Upgrading from 0.2.x:** v0.3.x fixes a fingerprint collision that could serve one function's result for another (a false HIT). Closing it changes how every function's identity is computed, so **existing persisted caches are invalidated once** — the first run after upgrading recomputes and reclaims the old files automatically. No action needed.
 
@@ -64,7 +64,7 @@ Plenty of libraries offer TTL, persistence, or LRU. None of them combine what da
 | Notebook restarts throwing work away | `persist=True` — atomic, versioned, corruption-safe on-disk format that survives restarts |
 | "Why was that a miss?!" | `func.cache.explain(...)` tells you exactly what happened and why — as pure observation |
 | Numba treated as an afterthought | First-class support at the dispatcher boundary — `fastmath`/`parallel`/`locals=`-aware identity, honest per-specialization cold/warm JIT metrics |
-| Results that outlive the data they came from | `depends_on=["data.csv"]` — *coming in V1.1*, with `profile()` (is caching even worth it?) |
+| Results that outlive the data they came from | `depends_on=["data.csv", cachau.env("MODE"), cachau.package("numpy")]` — a result dies when its file, env var, package version, or custom token changes |
 
 ## A taste of the API
 
@@ -100,7 +100,23 @@ def process(dataset, version):
     ...
 ```
 
-Coming in V1.1: `@cache(depends_on=["data/train.parquet"])` — invalidation when files, environment variables, or package versions change.
+Declare external inputs a result depends on, and Cachau invalidates when they change:
+
+```python
+@cache(depends_on=[
+    "data/train.parquet",                     # a file — content hash by default
+    cachau.file("big.bin", on="mtime"),       # or cheap mtime+size, opt-in
+    cachau.env("PIPELINE_MODE"),              # an environment variable
+    cachau.package("scikit-learn"),           # an installed package version
+    cachau.token(lambda: db.schema_version()),  # any custom token
+])
+def build_features(...):
+    ...
+```
+
+A changed dependency is a `dependency_changed` miss: the stale entry is dropped and the function recomputes. The fingerprints ride along as small metadata in each stored entry, not in the key — so a changed dependency overwrites the same entry, and the miss is attributed to the dependency instead of vanishing as a key-not-found. `explain()` names exactly which one changed.
+
+Files default to a **content hash** (correctness first — a same-size replacement that preserves the modification time still invalidates); `on="mtime"` opts into a cheaper mtime+size check for large files where hashing every lookup is the bottleneck. A declared dependency is assumed stable for the duration of one call — if it can change while the function runs, pass it as an argument so it enters the key.
 
 Every cached function carries its own control surface:
 
@@ -125,7 +141,16 @@ Expired:     3m 2s ago (at 2026-07-19 15:03:11 UTC)
 Size:        1.2 MB
 ```
 
-(V1.1 adds dependency answers: *which file changed, previous vs. current fingerprint*.)
+With `depends_on=`, a changed dependency reports as its own reason and names the culprit:
+
+```
+MISS
+Reason:      dependency_changed
+Changed dep: env:PIPELINE_MODE
+Namespace:   features.build_features
+Created:     2026-07-19 14:03:11 UTC
+Size:        1.2 MB
+```
 
 ### `profile()` — is caching even worth it? *(planned — V1.1)*
 
