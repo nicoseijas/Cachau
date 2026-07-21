@@ -29,9 +29,10 @@ from cachau.fingerprint import (
 from cachau.flight import KeyedLocks
 import inspect
 
-from cachau.keys import digest_arguments, digest_custom_key
+from cachau.keys import digest_arguments, digest_custom_key, normalize_call
 from cachau.memory import MemoryBackend
 from cachau.policy import LRUBudget
+from cachau.profile import CacheProfile, diagnose, largest_data_arg, measure
 from cachau.sizes import estimate_size, parse_size
 from cachau.stats import CacheStats
 
@@ -89,6 +90,8 @@ class CacheControl:
         key_builder: KeyBuilder,
         now: Clock,
         flights: KeyedLocks,
+        func: Callable[..., Any],
+        size_of: SizeOf,
         dependencies: tuple[LabeledDependency, ...] = (),
         code_change_invalidations: int = 0,
         evictions: int = 0,
@@ -134,6 +137,8 @@ class CacheControl:
         self._key_builder = key_builder
         self._now = now
         self._flights = flights
+        self._func = func
+        self._size_of = size_of
         self._dependencies = dependencies
         # Guards compound mutations of the invalidation bookkeeping, which is
         # function-wide state reachable from concurrent flights of different
@@ -226,6 +231,79 @@ class CacheControl:
                     **facts,
                 )
         return Explanation(outcome="HIT", reason="found", **common, **facts)
+
+    def profile(self, *args: Any, repeats: int = 3, **kwargs: Any) -> CacheProfile:
+        """Measure whether caching this call beats recomputing it.
+
+        Answers the cache-economics question (GUIDELINES.md §15): is
+        ``T_key + T_lookup + T_deserialize < T_recompute``? Reports the warm
+        recompute time, the cache-hit cost broken into key generation and
+        backend read, a verdict, the dominant cost, and a recommendation.
+
+        Unlike ``explain()`` this is NOT pure: it runs the function ``repeats``
+        times (plus one warm-up, so JIT compilation is never counted as normal
+        execution). It does not touch ``stats()`` counters, and it restores cache
+        state — if the entry was absent it is measured against a throwaway copy
+        that is then removed, so a call with a TTL or dependencies is never left
+        holding a bare entry. Side effects in the function itself do run, once
+        per execution.
+        """
+        if repeats < 1:
+            raise ConfigurationError("profile(repeats=) must be at least 1")
+        key = self._key_builder(*args, **kwargs)
+        # Warm up: compile the JIT specialization / fill any internal caches, and
+        # capture a representative value for the read measurement below. Timing
+        # is discarded — the first run is the cold one.
+        value = self._func(*args, **kwargs)
+        compute_seconds = measure(lambda: self._func(*args, **kwargs), repeats)
+        # Key generation and backend read are cheap; measure them more times so
+        # the min estimator has a clean floor to find.
+        cheap_repeats = max(repeats, 20)
+        key_seconds = measure(lambda: self._key_builder(*args, **kwargs), cheap_repeats)
+        existed = self._backend.get(key) is not None
+        if not existed:
+            self._backend.set(
+                key,
+                CacheEntry(
+                    value=value,
+                    namespace=self.namespace,
+                    created_at=self._now(),
+                    dependency_fingerprints=fingerprint_dependencies(
+                        self._dependencies
+                    ),
+                ),
+            )
+        try:
+            read_seconds = measure(lambda: self._backend.get(key), cheap_repeats)
+        finally:
+            if not existed:
+                try:
+                    self._backend.delete(key)
+                except Exception:  # noqa: BLE001 - measurement cleanup, best effort
+                    pass
+        try:
+            size_bytes: int | None = int(self._size_of(value))
+        except Exception:  # noqa: BLE001 - size is informational, never fatal
+            size_bytes = None
+        largest = largest_data_arg(normalize_call(self._func, args, kwargs))
+        verdict, primary_cost, recommendation = diagnose(
+            compute_seconds=compute_seconds,
+            key_seconds=key_seconds,
+            read_seconds=read_seconds,
+            largest_data=largest,
+        )
+        return CacheProfile(
+            namespace=self.namespace,
+            key=key,
+            repeats=repeats,
+            compute_seconds=compute_seconds,
+            key_seconds=key_seconds,
+            read_seconds=read_seconds,
+            size_bytes=size_bytes,
+            verdict=verdict,
+            primary_cost=primary_cost,
+            recommendation=recommendation,
+        )
 
     def clear(self) -> None:
         """Forget every stored result for this function."""
@@ -772,6 +850,8 @@ def _wrap(
         key_builder=build_key,
         now=peek_now,
         flights=flights,
+        func=func,
+        size_of=size_of,
         dependencies=dependencies,
         code_change_invalidations=purged,
         evictions=rehydrated_evictions,

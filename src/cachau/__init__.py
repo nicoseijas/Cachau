@@ -3,6 +3,7 @@
 from cachau.decorator import cache
 from cachau.dependencies import env, file, package, token
 from cachau.explanation import Explanation
+from cachau.profile import CacheProfile
 from cachau.stats import CacheStats
 from cachau.errors import (
     CachauError,
@@ -20,6 +21,7 @@ __all__ = [
     "package",
     "token",
     "CacheStats",
+    "CacheProfile",
     "CachauError",
     "Explanation",
     "ConfigurationError",

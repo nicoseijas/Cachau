@@ -16,7 +16,7 @@ def expensive_analysis(df, config):
     ...
 ```
 
-> **Status: v0.3.2 — the core engine plus validated Numba Level A support** (305 tests, CI on 3.10-3.13 plus free-threaded 3.13t/3.14t): normalized keys with type-tagged hashing (incl. closure captures), native NumPy/pandas identity, `key=`/`ignore=` escape hatches, code-change invalidation, TTL, LRU memory bounds that survive restarts, atomic corruption-safe persistence, same-key single-flight, `stats()` with miss reasons and cold/warm JIT accounting, `explain()`, and `depends_on=` external-dependency invalidation (files, env vars, package versions, custom tokens). Pre-1.0, so the API may still evolve. Next up: `profile()` (is caching even worth it?) (see [ROADMAP](ROADMAP.md)).
+> **Status: v0.3.2 — the core engine plus validated Numba Level A support** (324 tests, CI on 3.10-3.13 plus free-threaded 3.13t/3.14t): normalized keys with type-tagged hashing (incl. closure captures), native NumPy/pandas identity, `key=`/`ignore=` escape hatches, code-change invalidation, TTL, LRU memory bounds that survive restarts, atomic corruption-safe persistence, same-key single-flight, `stats()` with miss reasons and cold/warm JIT accounting, `explain()`, `depends_on=` external-dependency invalidation (files, env vars, package versions, custom tokens), and `profile()` (measured cache economics). Pre-1.0, so the API may still evolve. Next up: `inspect()` and Polars hashing (see [ROADMAP](ROADMAP.md)).
 >
 > **Upgrading from 0.2.x:** v0.3.x fixes a fingerprint collision that could serve one function's result for another (a false HIT). Closing it changes how every function's identity is computed, so **existing persisted caches are invalidated once** — the first run after upgrading recomputes and reclaims the old files automatically. No action needed.
 
@@ -127,7 +127,7 @@ build_features.cache.stats()        # hits, misses, hit rate, miss reasons, byte
 build_features.cache.clear()
 build_features.cache.invalidate(df, config)
 build_features.cache.explain(df, config)     # pure observation, never recomputes
-build_features.cache.profile(df, config)     # coming in V1.1
+build_features.cache.profile(df, config)     # measures: is caching worth it?
 ```
 
 ### `explain()` — transparency on demand
@@ -152,24 +152,27 @@ Created:     2026-07-19 14:03:11 UTC
 Size:        1.2 MB
 ```
 
-### `profile()` — is caching even worth it? *(planned — V1.1)*
+### `profile()` — is caching even worth it?
+
+`profile()` measures both sides of the cache-economics inequality (`T_key + T_lookup + T_deserialize < T_recompute`) for one concrete call — running the function, warmed up, so JIT compile time is never counted — and tells you which side wins and why:
 
 ```
-Cache suitability
+Cache economics: features.aggregate
 
-Computation (warm Numba):       182 ms
-Key generation:                 347 ms
-Cache lookup:                     2 ms
-Deserialization:                 41 ms
---------------------------------------
-Cache hit total:                390 ms
+Warm recompute:         3.9 ms
+Key generation:        16.0 ms
+Cache read:             0 us
+------------------------------
+Cache hit total:       16.0 ms
 
-Caching is slower than recomputation by ~2.1x.
-Primary cause:   hashing ndarray[float64, 480 MB]
-Recommendation:  provide an explicit stable key or dataset version.
+Caching is slower than recompute by 4.1x.
+Primary hit cost:     hashing ndarray[float64, 30.5 MB]
+Recommendation:       Provide an explicit stable key= (e.g. a dataset version)
+                      so the payload isn't hashed on every lookup - that is the
+                      whole cost here.
 ```
 
-Cachau doesn't just cache — it tells you when caching is a bad decision.
+Here hashing a 30-MB array to build the key costs more than just recomputing the result, so the cache makes things *worse* — and `profile()` says so, names the culprit, and points at the fix. Unlike `explain()`, it runs the function (it must, to measure recompute cost); it doesn't touch `stats()` and restores cache state afterward. Cachau doesn't just cache — it tells you when caching is a bad decision.
 
 ## The persistent cache directory is a trust boundary
 

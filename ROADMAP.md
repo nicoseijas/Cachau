@@ -61,13 +61,13 @@ Goal: the four-keyword experience, correct and observable.
 
 **Stretch goal**
 
-- [ ] `func.cache.profile(...)` — moved to V1.1 (Phase 2)
+- [x] `func.cache.profile(...)` — shipped in V1.1 (Phase 2)
 
 ## Phase 2 — V1.1: explain more, depend on data
 
 Goal: deepen the differentiators.
 
-- [ ] `cache.profile()` complete (if it didn't ship in V1): timing breakdown, net savings, primary-cost diagnosis, actionable recommendation
+- [x] `func.cache.profile()`: warm-recompute vs. cache-hit timing (key generation + backend read), net savings, verdict (worth it / marginal / not worth it), primary-cost diagnosis (names the dominant hit cost, e.g. hashing a large ndarray), and an actionable recommendation. Runs the function to measure (warmed up, JIT excluded); never touches `stats()`, restores cache state
 - [ ] `func.cache.inspect()` — entry browsing
 - [x] `depends_on=[...]` external dependency invalidation: files (mtime / size / content hash), environment variables, package versions, user-defined tokens — declared via bare paths or `cachau.file/env/package/token`; fingerprints stored per-entry (read header-only), compared on read, surfaced as a distinct `miss_dependency_changed` reason and named in `explain()`
 - [ ] Polars hashing support
