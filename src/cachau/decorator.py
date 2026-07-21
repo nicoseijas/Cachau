@@ -26,6 +26,7 @@ from cachau.fingerprint import (
     function_namespace,
     is_jit_dispatcher,
 )
+from cachau.inspection import CacheEntryView, Inspection
 from cachau.flight import KeyedLocks
 import inspect
 
@@ -47,6 +48,9 @@ _perf_counter = time.perf_counter
 # Bounded cap for miss-reason attribution markers (label-only: dropping one
 # can mislabel a future miss as not_found, never affect correctness).
 _INVALIDATION_MARKER_CAP = 4096
+# Eviction markers only enrich explain() ("evicted" vs "not_found"); dropping one
+# simply loses that annotation for the oldest evicted key, never any correctness.
+_EVICTION_MARKER_CAP = 4096
 _MARKER_MISSING = object()
 Persist = bool | str | os.PathLike
 # Every tally CacheControl keeps. Naming them once gives stats() an explicit
@@ -128,6 +132,10 @@ class CacheControl:
         # the wrapper must never serve these keys from the backend, or an
         # explicitly invalidated value would come back as a false HIT.
         self._pending_invalidations: set[str] = set()
+        # Eviction markers: keys the LRU budget dropped, so explain() can say
+        # "evicted" instead of "not_found". Pure annotation, bounded, cleared
+        # when a key is cached again.
+        self._eviction_markers: OrderedDict[str, None] = OrderedDict()
         # Savings average uses only computations whose result was actually
         # cached; skipped/oversized computes can never produce a future hit.
         self._saved_basis_seconds = 0.0
@@ -184,6 +192,19 @@ class CacheControl:
             self.total_compute_seconds += compute_elapsed
             self.compute_count += 1
 
+    def _note_eviction(self, key: str) -> None:
+        """Remember that the budget evicted ``key`` (bounded, LRU-style)."""
+        with self._mutation_guard:
+            self._eviction_markers[key] = None
+            self._eviction_markers.move_to_end(key)
+            while len(self._eviction_markers) > _EVICTION_MARKER_CAP:
+                self._eviction_markers.popitem(last=False)
+
+    def _note_recached(self, key: str) -> None:
+        """A fresh value now occupies ``key``; it is no longer 'evicted'."""
+        with self._mutation_guard:
+            self._eviction_markers.pop(key, None)
+
     def explain(self, *args: Any, **kwargs: Any) -> Explanation:
         """Explain what a call with these arguments would do, and why.
 
@@ -208,9 +229,12 @@ class CacheControl:
         peek = getattr(self._backend, "peek", self._backend.get)
         entry = peek(key)
         if entry is None:
-            reason = (
-                "invalidated" if key in self._invalidation_markers else "not_found"
-            )
+            if key in self._invalidation_markers:
+                reason = "invalidated"
+            elif key in self._eviction_markers:
+                reason = "evicted"
+            else:
+                reason = "not_found"
             return Explanation(outcome="MISS", reason=reason, **common)
         facts = {
             "created_at": entry.created_at,
@@ -223,10 +247,16 @@ class CacheControl:
             current = fingerprint_dependencies(self._dependencies)
             if entry.dependency_fingerprints != current:
                 changed = changed_labels(entry.dependency_fingerprints, current)
+                stored = entry.dependency_fingerprints or {}
+                now_fp = current or {}
+                diff = {
+                    label: (stored.get(label), now_fp.get(label)) for label in changed
+                }
                 return Explanation(
                     outcome="MISS",
                     reason="dependency_changed",
                     changed_dependencies=changed,
+                    dependency_diff=diff,
                     **common,
                     **facts,
                 )
@@ -305,6 +335,35 @@ class CacheControl:
             recommendation=recommendation,
         )
 
+    def inspect(self) -> Inspection:
+        """List this function's cached entries, newest first.
+
+        Pure observation, like ``explain()``: reads entry headers only (no
+        payload is deserialized), never mutates cache state or counters. Each
+        view carries creation time, size, remaining TTL, and any dependency
+        fingerprints. Entries quarantined by a failed ``invalidate()`` are
+        omitted — they are still physically present but will never be served.
+        """
+        checked_at = self._now()
+        with self._mutation_guard:
+            pending = set(self._pending_invalidations)
+        views = [
+            CacheEntryView(
+                key=row.key,
+                namespace=row.namespace,
+                checked_at=checked_at,
+                created_at=row.created_at,
+                expires_at=row.expires_at,
+                size_bytes=row.size,
+                dependency_fingerprints=row.dependency_fingerprints,
+            )
+            for row in self._iter_metadata()
+            if row.namespace == self.namespace and row.key not in pending
+        ]
+        # Newest first; entries with no recorded creation time sort last.
+        views.sort(key=lambda v: (v.created_at is None, -(v.created_at or 0.0)))
+        return Inspection(namespace=self.namespace, entries=tuple(views))
+
     def clear(self) -> None:
         """Forget every stored result for this function."""
         self._backend.clear(namespace=self.namespace)
@@ -313,6 +372,7 @@ class CacheControl:
         with self._mutation_guard:
             self._invalidation_markers.clear()
             self._pending_invalidations.clear()
+            self._eviction_markers.clear()
 
     def invalidate(self, *args: Any, **kwargs: Any) -> None:
         """Forget the stored result for one specific invocation.
@@ -815,6 +875,7 @@ def _wrap(
             for evicted_key in budget.admit(key, size):
                 safe_delete(evicted_key)
                 control._bump("evictions")
+                control._note_eviction(evicted_key)
         try:
             store.set(
                 key,
@@ -831,6 +892,7 @@ def _wrap(
             )
             control._record_commit(None if is_cold_jit else compute_elapsed)
             control._pending_invalidations.discard(key)  # fresh value overwrote it
+            control._note_recached(key)  # no longer 'evicted' — it's cached again
         except Exception:
             # The cache is an optimization: a failed write (serialization,
             # disk) never loses the computed result. Release the budget slot

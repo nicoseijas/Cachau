@@ -68,10 +68,10 @@ Goal: the four-keyword experience, correct and observable.
 Goal: deepen the differentiators.
 
 - [x] `func.cache.profile()`: warm-recompute vs. cache-hit timing (key generation + backend read), net savings, verdict (worth it / marginal / not worth it), primary-cost diagnosis (names the dominant hit cost, e.g. hashing a large ndarray), and an actionable recommendation. Runs the function to measure (warmed up, JIT excluded); never touches `stats()`, restores cache state
-- [ ] `func.cache.inspect()` — entry browsing
+- [x] `func.cache.inspect()` — entry browsing: newest-first listing of `CacheEntryView` (key digest, created/age, size, remaining TTL, dependency fingerprints), header-only reads, pure observation, quarantined entries omitted
 - [x] `depends_on=[...]` external dependency invalidation: files (mtime / size / content hash), environment variables, package versions, user-defined tokens — declared via bare paths or `cachau.file/env/package/token`; fingerprints stored per-entry (read header-only), compared on read, surfaced as a distinct `miss_dependency_changed` reason and named in `explain()`
 - [ ] Polars hashing support
-- [ ] Richer `explain()`: eviction history, dependency fingerprint diffs
+- [x] Richer `explain()`: `evicted` reason (LRU-dropped vs never-cached), and per-changed-dependency fingerprint diffs (`{label: (stored, current)}`, rendered `label (before -> after)`)
 - [ ] Notebook polish: cell re-runs never destroy useful persistent caches; code changes invalidate understandably
 - [x] Benchmark suite with honest methodology (compile → warm up → benchmark; cold JIT reported separately) — see [BENCHMARKS.md](BENCHMARKS.md) and `benchmarks/`
 

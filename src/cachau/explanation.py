@@ -18,6 +18,7 @@ from dataclasses import dataclass
 class Explanation:
     outcome: str  # "HIT" | "MISS"
     # "found" | "not_found" | "expired" | "invalidated" | "dependency_changed"
+    # | "evicted"
     reason: str
     key: str
     namespace: str
@@ -28,6 +29,10 @@ class Explanation:
     size_bytes: int | None = None
     # Which declared dependencies changed, when reason == "dependency_changed".
     changed_dependencies: tuple[str, ...] | None = None
+    # Per-changed-dependency fingerprint diff: {label: (stored, current)}, where
+    # a ``None`` side means the dependency was absent then or now. Lets explain()
+    # answer not just WHICH dependency changed but HOW.
+    dependency_diff: dict[str, tuple[str | None, str | None]] | None = None
 
     @property
     def age_seconds(self) -> float | None:
@@ -49,7 +54,12 @@ class Explanation:
 
     def __str__(self) -> str:
         lines = [self.outcome, f"Reason:      {self.reason}"]
-        if self.changed_dependencies:
+        if self.dependency_diff:
+            for label, (stored, current) in sorted(self.dependency_diff.items()):
+                before = stored if stored is not None else "<none>"
+                after = current if current is not None else "<none>"
+                lines.append(f"Changed dep: {label} ({before} -> {after})")
+        elif self.changed_dependencies:
             lines.append(f"Changed dep: {', '.join(self.changed_dependencies)}")
         lines.append(f"Namespace:   {self.namespace}")
         if self.created_at is not None:
