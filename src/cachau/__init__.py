@@ -17,7 +17,7 @@ from cachau.errors import (
     UnhashableArgumentError,
 )
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 __all__ = [
     "cache",
     "file",
