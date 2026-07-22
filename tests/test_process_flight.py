@@ -223,3 +223,64 @@ print(build(21))
     markers = list(tmp_path.glob("compute-*.marker"))
     assert len(markers) == 1  # exactly one process computed; the burst coalesced
     assert not list((tmp_path / "store").glob("*.lock"))
+
+
+# --------------------------------------------------------------------------- #
+# Heartbeat: staleness decoupled from compute duration
+# --------------------------------------------------------------------------- #
+
+
+def test_heartbeat_prevents_preemption_of_a_healthy_slow_holder(
+    tmp_path, monkeypatch
+):
+    """The downstream stress-test finding: with staleness tied to a fixed
+    threshold, a waiter declares a healthy still-computing holder's lock stale
+    and preempts it (2 computes instead of 1). The heartbeat keeps a live
+    holder's lock fresh no matter how long the compute runs."""
+    monkeypatch.setattr("cachau.interprocess._HEARTBEAT_SECONDS", 0.05)
+    monkeypatch.setattr("cachau.decorator._PROCESS_STALE_AFTER", 0.3)
+    computes = []
+
+    def make():  # two functions, same namespace+body: same key, separate flights
+        @cache(persist=str(tmp_path), coalesce="processes", namespace="shared")
+        def f(x):
+            computes.append(x)
+            time.sleep(1.0)  # far longer than the stale threshold
+            return x * 2
+
+        return f
+
+    holder_fn, waiter_fn = make(), make()
+    results = {}
+    holder = threading.Thread(target=lambda: results.setdefault("h", holder_fn(1)))
+    holder.start()
+    time.sleep(0.3)  # let the holder win the lock and get deep into computing
+    results["w"] = waiter_fn(1)
+    holder.join()
+    assert results == {"h": 2, "w": 2}
+    assert len(computes) == 1  # the healthy holder was never preempted
+    waiter_stats = waiter_fn.cache.stats()
+    assert waiter_stats.stale_locks_broken == 0
+    assert waiter_stats.process_coalesced_hits == 1
+
+
+def test_heartbeat_refreshes_the_lock_mtime(tmp_path, monkeypatch):
+    monkeypatch.setattr("cachau.interprocess._HEARTBEAT_SECONDS", 0.05)
+    lock = ProcessLock(tmp_path / "k.lock")
+    assert lock.try_acquire()
+    try:
+        time.sleep(0.4)
+        age = lock.age_seconds()
+        assert age is not None and age < 0.3  # kept fresh well past creation
+    finally:
+        lock.release()
+
+
+def test_heartbeat_stops_on_release(tmp_path, monkeypatch):
+    monkeypatch.setattr("cachau.interprocess._HEARTBEAT_SECONDS", 0.05)
+    lock = ProcessLock(tmp_path / "k.lock")
+    assert lock.try_acquire()
+    assert lock._heartbeat_thread is not None and lock._heartbeat_thread.is_alive()
+    lock.release()
+    lock._heartbeat_thread.join(2.0)
+    assert not lock._heartbeat_thread.is_alive()
