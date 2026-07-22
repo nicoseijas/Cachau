@@ -235,7 +235,15 @@ class CacheControl:
                 reason = "evicted"
             else:
                 reason = "not_found"
-            return Explanation(outcome="MISS", reason=reason, **common)
+            # A failed write leaves nothing to find, so a plain "not_found"
+            # would report a silently broken store as an innocent cold cache.
+            failed_writes = self.write_errors if reason == "not_found" else 0
+            return Explanation(
+                outcome="MISS",
+                reason=reason,
+                write_errors=failed_writes or None,
+                **common,
+            )
         facts = {
             "created_at": entry.created_at,
             "expires_at": entry.expires_at,

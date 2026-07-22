@@ -155,6 +155,17 @@ Size:        1.2 MB
 
 An entry the LRU budget dropped reports `evicted` rather than `not_found`, so you can tell "never cached" from "cached, then pushed out".
 
+A failed write never loses the computed result — but it also leaves nothing behind to find, so a broken store (unwritable `persist=` directory, unpicklable results) would otherwise look exactly like a cold cache. When a function has already recorded write failures, a `not_found` miss says so:
+
+```
+MISS
+Reason:      not_found
+Warning:     2 cache writes failed — this may be a broken store, not a cold cache
+Namespace:   features.build_features
+```
+
+The count is also on the explanation as `write_errors` (and, function-wide, in `stats()`).
+
 ### `inspect()` — browse what's cached
 
 `inspect()` lists the entries a function currently holds — newest first, read from entry headers without deserializing any values, so it stays cheap over a large persistent cache:

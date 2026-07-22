@@ -74,6 +74,7 @@ Goal: deepen the differentiators.
 - [x] Richer `explain()`: `evicted` reason (LRU-dropped vs never-cached), and per-changed-dependency fingerprint diffs (`{label: (stored, current)}`, rendered `label (before -> after)`)
 - [ ] Notebook polish: cell re-runs never destroy useful persistent caches; code changes invalidate understandably
 - [x] Benchmark suite with honest methodology (compile → warm up → benchmark; cold JIT reported separately) — see [BENCHMARKS.md](BENCHMARKS.md) and `benchmarks/`
+- [x] `explain()` surfaces `write_errors` on a `not_found` miss — a broken store (unwritable persist dir, unpicklable results) no longer looks identical to a cold cache
 
 ## Phase 3 — V2: Numba Level B and hardening
 
@@ -85,6 +86,8 @@ Goal: broaden supported types with the same correctness bar. Nothing is "support
 - [ ] Extension-type adapter API
 - [ ] Custom serializer registration (Arrow/Parquet, native NumPy formats)
 - [ ] Mutation policy: detect-and-reject where possible, documented opt-in otherwise
+- [ ] Transitive code changes: the fingerprint covers only the function's own code object (Phase 0 limitation), so editing a module-level helper called by global lookup yields a false HIT. Minimum: docs and `profile()` push hard toward `depends_on=[token(...)]` when the function reads globals; maximum: opt-in call-graph fingerprinting
+- [ ] `verify=` mode: occasionally recompute a HIT and compare against the cached value, reporting loudly on mismatch — catches both transitive-code false HITs and nondeterminism
 - [ ] Cross-machine portability of persisted results (semantic identity, not compilation-artifact identity)
 
 ## Explicitly out of scope (until the local model is consolidated)
