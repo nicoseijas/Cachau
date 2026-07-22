@@ -383,3 +383,108 @@ def test_failed_write_does_not_evict_healthy_entries():
     stats = build.cache.stats()
     assert stats.evictions == 0
     assert stats.entries == healthy  # nobody was sacrificed for a failed write
+
+
+# --------------------------------------------------------------------------- #
+# Failed eviction deletes must be retried, not leaked (#61)
+# --------------------------------------------------------------------------- #
+
+
+class _WindowsyDeletes(MemoryBackend):
+    """First delete of each key fails, as when a concurrent reader holds the
+    entry file open on Windows; later attempts succeed (the reader is gone)."""
+
+    def __init__(self):
+        super().__init__()
+        self.failed_once = set()
+
+    def delete(self, key):
+        if key not in self.failed_once:
+            self.failed_once.add(key)
+            raise PermissionError(5, "file held open by a reader")
+        super().delete(key)
+
+
+def test_failed_eviction_deletes_are_retried_on_later_commits():
+    """The budget pops the key BEFORE the delete; if the delete fails and
+    nothing retries, the entry is a permanent orphan past max_memory."""
+    backend = _WindowsyDeletes()
+
+    @cache(backend=backend, max_memory=250, size_of=lambda v: 100)
+    def build(k):
+        return k
+
+    for k in range(12):
+        build(k)
+
+    stored = len(list(backend.iter_entries()))
+    # 10 evictions, every delete failed once. Without retries: 12 entries
+    # (every orphan leaks). With opportunistic retries each commit drains
+    # earlier failures, so only the live pair plus the freshest pending
+    # failure can remain.
+    assert build.cache.delete_errors >= 1
+    assert stored <= 4
+
+
+def test_recommitted_key_is_not_deleted_by_a_pending_retry():
+    backend = _WindowsyDeletes()
+
+    @cache(backend=backend, max_memory=250, size_of=lambda v: 100)
+    def build(k):
+        return k
+
+    build(1)
+    build(2)
+    build(3)  # evicts 1; delete fails → key 1 enters the pending ledger
+    build(1)  # recommitted: live again, must leave the ledger (evicts 2)
+    key_1 = build.cache._key_builder(1)
+    assert key_1 not in build.cache._pending_eviction_deletes
+    build(4)  # evicts 3; its drain must not touch 1's fresh entry
+    assert backend.get(key_1) is not None  # never deleted by a stale retry
+    assert build(1) == 1
+
+
+def test_clear_forgets_pending_eviction_retries():
+    backend = _WindowsyDeletes()
+
+    @cache(backend=backend, max_memory=250, size_of=lambda v: 100)
+    def build(k):
+        return k
+
+    build(1)
+    build(2)
+    build(3)  # evicts 1; delete fails → pending
+    build.cache.clear()
+    assert not build.cache._pending_eviction_deletes
+
+
+def test_same_key_read_contention_converges_to_the_bound(tmp_path):
+    """The downstream 'same' scenario: threads hammering the SAME keys keep
+    entry files open through concurrent HITs, so eviction deletes fail on
+    Windows and every failure used to leak an orphan (40 files against a
+    ~5-entry budget). With retries the store converges once readers pass."""
+    import pathlib
+    import threading
+
+    @cache(persist=str(tmp_path), max_memory=4705)
+    def build(k):
+        return "x" * 800 + str(k)
+
+    def worker():
+        for _ in range(10):
+            for k in range(40):
+                build(k)
+
+    threads = [threading.Thread(target=worker) for _ in range(12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Quiescent convergence pass: no concurrent readers remain, so each
+    # commit drains a batch of pending deletes.
+    for i in range(40):
+        build(1000 + i)
+
+    files = list(pathlib.Path(tmp_path).glob("*.cachau"))
+    assert len(files) <= 10  # was 40: every failed delete a permanent orphan
