@@ -67,6 +67,13 @@ _INVALIDATION_MARKER_CAP = 4096
 # Eviction markers only enrich explain() ("evicted" vs "not_found"); dropping one
 # simply loses that annotation for the oldest evicted key, never any correctness.
 _EVICTION_MARKER_CAP = 4096
+# Eviction deletes that failed (Windows: the entry file was open in a
+# concurrent reader). Bounded like the marker sets; overflowing drops the
+# oldest, whose file then lingers until clear() or a restart's rehydration.
+_PENDING_EVICTION_DELETE_CAP = 4096
+# How many pending deletes each commit retries — bounds the extra I/O a
+# single commit can pay for earlier failures.
+_EVICTION_RETRY_BATCH = 8
 _MARKER_MISSING = object()
 # coalesce="processes" wait bounds. A waiter with local compute history waits
 # FACTOR x the mean compute (plus a second, capped); a cold worker with no
@@ -177,6 +184,12 @@ class CacheControl:
         # "evicted" instead of "not_found". Pure annotation, bounded, cleared
         # when a key is cached again.
         self._eviction_markers: OrderedDict[str, None] = OrderedDict()
+        # Evicted keys whose physical delete FAILED (Windows: the file was
+        # open in a concurrent reader). The budget has already dropped them,
+        # so no other path would ever retry — without this ledger every
+        # failure is a permanent orphan past max_memory (#61). Later commits
+        # drain it; readers are transient, so retries land quickly.
+        self._pending_eviction_deletes: OrderedDict[str, None] = OrderedDict()
         # Savings average uses only computations whose result was actually
         # cached; skipped/oversized computes can never produce a future hit.
         self._saved_basis_seconds = 0.0
@@ -443,6 +456,7 @@ class CacheControl:
             self._invalidation_markers.clear()
             self._pending_invalidations.clear()
             self._eviction_markers.clear()
+            self._pending_eviction_deletes.clear()  # the files are gone too
 
     def invalidate(self, *args: Any, **kwargs: Any) -> None:
         """Forget the stored result for one specific invocation.
@@ -888,6 +902,45 @@ def _wrap(
         except Exception:
             control._bump("delete_errors")
 
+    def evict_delete(evicted_key: str) -> None:
+        # The eviction's delete. Unlike expired/stale entries — which every
+        # later access of their key re-deletes — an evicted key has already
+        # left the budget, so a failed delete here has NO natural retry: on
+        # Windows a file held open by a concurrent reader survives as a
+        # permanent orphan past max_memory (#61). Remember it; later commits
+        # drain the ledger once the transient readers are gone.
+        try:
+            store.delete(evicted_key)
+        except Exception:
+            control._bump("delete_errors")
+            with control._mutation_guard:
+                pending = control._pending_eviction_deletes
+                pending[evicted_key] = None
+                pending.move_to_end(evicted_key)
+                while len(pending) > _PENDING_EVICTION_DELETE_CAP:
+                    pending.popitem(last=False)
+
+    def drain_pending_evictions(current_key: str) -> None:
+        # Bounded, opportunistic: snapshot under the guard, delete outside it
+        # (the guard is never held across backend I/O). A retry that fails
+        # again stays in the ledger without re-counting delete_errors — the
+        # failure was already recorded when the eviction happened.
+        if not control._pending_eviction_deletes:
+            return
+        with control._mutation_guard:
+            batch = [
+                key
+                for key in control._pending_eviction_deletes
+                if key != current_key
+            ][:_EVICTION_RETRY_BATCH]
+        for pending_key in batch:
+            try:
+                store.delete(pending_key)
+            except Exception:  # noqa: BLE001 - still held open: retry later
+                continue
+            with control._mutation_guard:
+                control._pending_eviction_deletes.pop(pending_key, None)
+
     _NOT_SERVED = object()
 
     def _fresh_entry(
@@ -1154,9 +1207,14 @@ def _wrap(
             # tracked-but-absent phantom that costs one later MISS and heals
             # on the next commit of that key. Bounded, never incorrect.
             for evicted_key in budget.admit(key, size):
-                safe_delete(evicted_key)
+                evict_delete(evicted_key)
                 control._bump("evictions")
                 control._note_eviction(evicted_key)
+        with control._mutation_guard:
+            # This key's entry is live again: a stale pending retry from an
+            # earlier eviction must not delete the fresh file.
+            control._pending_eviction_deletes.pop(key, None)
+        drain_pending_evictions(key)
         control._record_commit(None if is_cold_jit else compute_elapsed)
         control._pending_invalidations.discard(key)  # fresh value overwrote it
         control._note_recached(key)  # no longer 'evicted' — it's cached again
