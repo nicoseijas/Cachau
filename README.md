@@ -16,7 +16,7 @@ def expensive_analysis(df, config):
     ...
 ```
 
-> **Status: v0.4.0 — the core engine plus validated Numba Level A support** (339 tests, CI on 3.10-3.13 plus free-threaded 3.13t/3.14t): normalized keys with type-tagged hashing (incl. closure captures), native NumPy/pandas identity, `key=`/`ignore=` escape hatches, code-change invalidation, TTL, LRU memory bounds that survive restarts, atomic corruption-safe persistence, same-key single-flight, `stats()` with miss reasons and cold/warm JIT accounting, `explain()` (with eviction and dependency-diff detail), `inspect()`, `depends_on=` external-dependency invalidation (files, env vars, package versions, custom tokens), and `profile()` (measured cache economics). Pre-1.0, so the API may still evolve. Next up: Polars hashing (see [ROADMAP](ROADMAP.md)).
+> **Status: v0.4.0 — the core engine plus validated Numba Level A support** (339 tests, CI on 3.10-3.13 plus free-threaded 3.13t/3.14t): normalized keys with type-tagged hashing (incl. closure captures), native NumPy/pandas identity, `key=`/`ignore=` escape hatches, code-change invalidation, TTL, LRU memory bounds that survive restarts, atomic corruption-safe persistence, same-key single-flight, `stats()` with miss reasons and cold/warm JIT accounting, `explain()` (with eviction and dependency-diff detail), `inspect()`, `depends_on=` external-dependency invalidation (files, env vars, package versions, custom tokens, helper implementations), and `profile()` (measured cache economics). Pre-1.0, so the API may still evolve. Next up: Polars hashing (see [ROADMAP](ROADMAP.md)).
 >
 > **Upgrading from 0.2.x:** v0.3.x fixes a fingerprint collision that could serve one function's result for another (a false HIT). Closing it changes how every function's identity is computed, so **existing persisted caches are invalidated once** — the first run after upgrading recomputes and reclaims the old files automatically. No action needed.
 
@@ -109,6 +109,7 @@ Declare external inputs a result depends on, and Cachau invalidates when they ch
     cachau.env("PIPELINE_MODE"),              # an environment variable
     cachau.package("scikit-learn"),           # an installed package version
     cachau.token(lambda: db.schema_version()),  # any custom token
+    cachau.code(normalize),                   # a helper function's implementation
 ])
 def build_features(...):
     ...
@@ -117,6 +118,8 @@ def build_features(...):
 A changed dependency is a `dependency_changed` miss: the stale entry is dropped and the function recomputes. The fingerprints ride along as small metadata in each stored entry, not in the key — so a changed dependency overwrites the same entry, and the miss is attributed to the dependency instead of vanishing as a key-not-found. `explain()` names exactly which one changed.
 
 Files default to a **content hash** (correctness first — a same-size replacement that preserves the modification time still invalidates); `on="mtime"` opts into a cheaper mtime+size check for large files where hashing every lookup is the bottleneck. A declared dependency is assumed stable for the duration of one call — if it can change while the function runs, pass it as an argument so it enters the key.
+
+**What the code fingerprint does not see.** Changing a cached function's own implementation invalidates automatically, and so does changing a value or function it captures by closure. But a module-level helper called by global lookup is outside the fingerprint: edit the helper, restart, and the cache serves results computed with the old code. `cachau.code(helper)` closes that gap — it fingerprints the helper's implementation (bytecode, constants, closures, same digest as the cached function itself) and invalidates as `dependency_changed` when it differs. `profile()` warns about same-package helpers that are called by global lookup and left undeclared.
 
 Every cached function carries its own control surface:
 

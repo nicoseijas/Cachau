@@ -86,7 +86,8 @@ Goal: broaden supported types with the same correctness bar. Nothing is "support
 - [ ] Extension-type adapter API
 - [ ] Custom serializer registration (Arrow/Parquet, native NumPy formats)
 - [ ] Mutation policy: detect-and-reject where possible, documented opt-in otherwise
-- [ ] Transitive code changes: the fingerprint covers only the function's own code object (Phase 0 limitation), so editing a module-level helper called by global lookup yields a false HIT. Minimum: docs and `profile()` push hard toward `depends_on=[token(...)]` when the function reads globals; maximum: opt-in call-graph fingerprinting
+- [x] Transitive code changes, declared mitigation (#27): `cachau.code(helper)` fingerprints a callable's implementation as a dependency, and `profile()` flags same-package module-level functions called by global lookup that are neither closure-captured nor declared
+- [ ] Opt-in call-graph fingerprinting: automatic transitive invalidation without declaring each helper
 - [ ] `verify=` mode: occasionally recompute a HIT and compare against the cached value, reporting loudly on mismatch — catches both transitive-code false HITs and nondeterminism
 - [ ] Cross-machine portability of persisted results (semantic identity, not compilation-artifact identity)
 

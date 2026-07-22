@@ -36,9 +36,14 @@ import hashlib
 import importlib.metadata
 import os
 from dataclasses import dataclass
-from typing import Any, NamedTuple, Protocol, runtime_checkable
+from typing import Any, Callable, NamedTuple, Protocol, runtime_checkable
 
 from cachau.errors import ConfigurationError, UnhashableArgumentError
+from cachau.fingerprint import (
+    function_fingerprint,
+    function_namespace,
+    unwrap_function,
+)
 from cachau.keys import _digest_value
 
 _ABSENT = "<absent>"
@@ -190,6 +195,48 @@ class TokenDependency:
             ) from None
 
 
+@dataclass(frozen=True)
+class CodeDependency:
+    """A callable whose implementation should invalidate results.
+
+    Closes the transitive-code gap: the function fingerprint covers only the
+    cached function's own code (plus closures), so a module-level helper called
+    by global lookup can change without invalidating — a false HIT after an
+    edit-and-restart. Declaring ``depends_on=[cachau.code(helper)]`` folds the
+    helper's implementation fingerprint (bytecode, constants, closure captures —
+    the same digest used for the cached function itself) into every entry, so
+    editing the helper misses with ``dependency_changed``.
+
+    The descriptor holds the function OBJECT and is validated at declaration:
+    non-callables and callables without a code object (builtins, C extensions)
+    fail loudly here, not on the first call. A cachau-cached function (or any
+    ``functools.wraps`` wrapper) is unwrapped to the user's implementation.
+    Rebinding the global NAME to a different function within one process is not
+    observed — the same contract as a closure capture; the edit-and-restart
+    scenario is the one this exists for.
+    """
+
+    func: Callable[..., Any]
+    name: str | None = None
+
+    def __post_init__(self) -> None:
+        if not callable(self.func):
+            raise ConfigurationError(
+                f"cachau.code() takes a function, got {self.func!r}"
+            )
+        unwrapped = unwrap_function(self.func)
+        object.__setattr__(self, "func", unwrapped)
+        function_fingerprint(unwrapped)  # unfingerprintable? fail at declaration
+
+    def label(self) -> str:
+        if self.name is not None:
+            return f"code:{self.name}"
+        return f"code:{function_namespace(self.func)}"
+
+    def fingerprint(self) -> str:
+        return function_fingerprint(self.func)[:_CONTENT_DIGEST_CHARS]
+
+
 def file(path: os.PathLike[str] | str, *, on: str = "content") -> FileDependency:
     """Declare a file dependency; see :class:`FileDependency`."""
     return FileDependency(path, on)
@@ -208,6 +255,11 @@ def package(name: str) -> PackageDependency:
 def token(value: Any, *, name: str | None = None) -> TokenDependency:
     """Declare a user-defined dependency token; see :class:`TokenDependency`."""
     return TokenDependency(value, name)
+
+
+def code(func: Callable[..., Any], *, name: str | None = None) -> CodeDependency:
+    """Declare a helper-implementation dependency; see :class:`CodeDependency`."""
+    return CodeDependency(func, name)
 
 
 class LabeledDependency(NamedTuple):

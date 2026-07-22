@@ -6,15 +6,18 @@ and constants, recursing into nested code objects so their memory addresses
 never leak into the digest. It deliberately ignores volatile details (line
 numbers, filenames) so that moving a function does not invalidate its cache.
 
-Known limitation (Phase 0): the fingerprint covers only the function's own
-code object. Values captured by closure and the implementations of other
-functions it calls (globals, imports) are not included — if they affect the
-result, pass them as arguments or declare them as dependencies.
+Known limitation (Phase 0): the fingerprint covers the function's own code
+object and its closure captures, but NOT the implementations of other functions
+it calls by global lookup (module-level helpers, imports) — editing such a
+helper does not invalidate. Declare them with ``depends_on=[cachau.code(helper)]``
+(``profile()`` flags undeclared ones), capture them by closure, or pass their
+results as arguments.
 """
 
 from __future__ import annotations
 
 import hashlib
+import sys
 import types
 from typing import Any, Callable
 
@@ -156,6 +159,95 @@ def _feed_closure(hasher: Any, func: Callable[..., Any], seen: set[int]) -> None
                 hasher.update(
                     f"<opaque:{type(contents).__qualname__}:{id(contents)}>".encode()
                 )
+
+
+def unwrap_function(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Follow ``__wrapped__`` (``functools.wraps``) down to the real function.
+
+    Stops at a JIT dispatcher: Numba puts ``__wrapped__`` on dispatchers, but
+    unwrapping one to its ``py_func`` would drop the semantic compile options
+    (``fastmath``, ``parallel``, ...) from the fingerprint — two kernels
+    differing only in those options would fingerprint identically. Bounded, so
+    a pathological self-referential wrapper chain cannot loop.
+    """
+    seen: set[int] = set()
+    while (
+        not is_jit_dispatcher(func)
+        and getattr(func, "__wrapped__", None) is not None
+        and id(func) not in seen
+    ):
+        seen.add(id(func))
+        func = func.__wrapped__
+    return func
+
+
+def referenced_global_functions(
+    func: Callable[..., Any],
+) -> tuple[tuple[str, Callable[..., Any]], ...]:
+    """Same-package module-level functions the code calls by global lookup.
+
+    These are exactly the calls the fingerprint does NOT cover (see the module
+    docstring): editing one changes results without invalidating. Scans
+    ``co_names`` of the code object and every nested code object (lambdas,
+    inner defs), resolving each name in the function's globals. Only
+    first-party helpers are reported — the same module, or a module that is
+    neither stdlib nor installed under site-packages — because only the user's
+    own code changes underfoot; installed code is ``cachau.package()``
+    territory. A heuristic for nudging, never for correctness decisions.
+    """
+    parts = _dispatcher_parts(func)
+    target = parts[0] if parts is not None else func
+    code = getattr(target, "__code__", None)
+    if code is None:
+        return ()
+    module_globals = getattr(target, "__globals__", None) or {}
+    own_module = getattr(target, "__module__", "") or ""
+    found: dict[str, Callable[..., Any]] = {}
+    for name in sorted(_all_code_names(code)):
+        value = module_globals.get(name)
+        if value is None or not callable(value):
+            continue
+        resolved = unwrap_function(value)
+        if is_jit_dispatcher(resolved):
+            resolved = resolved.py_func
+        if not isinstance(resolved, types.FunctionType):
+            continue
+        if resolved is target or resolved is func:
+            continue  # recursion is the function's own, already fingerprinted
+        module = getattr(resolved, "__module__", "") or ""
+        if module != own_module and not _is_first_party_module(module):
+            continue
+        found[name] = resolved
+    return tuple(found.items())
+
+
+def _is_first_party_module(module_name: str) -> bool:
+    """Whether a module looks like the user's own code rather than a dependency.
+
+    Stdlib, installed packages (site-packages/dist-packages), and cachau itself
+    are excluded. A module that cannot be located (builtin, not imported, no
+    ``__file__``) is treated as NOT first-party — when in doubt, stay quiet
+    rather than nag about code the user does not own.
+    """
+    top = module_name.split(".", 1)[0]
+    if not top or top == "cachau":
+        return False
+    if top in getattr(sys, "stdlib_module_names", ()):
+        return False
+    module = sys.modules.get(top)
+    file = getattr(module, "__file__", None)
+    if file is None:
+        return False
+    normalized = file.replace("\\", "/").lower()
+    return "site-packages" not in normalized and "dist-packages" not in normalized
+
+
+def _all_code_names(code: types.CodeType) -> set[str]:
+    names = set(code.co_names)
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            names |= _all_code_names(const)
+    return names
 
 
 def _feed_framed(hasher: Any, tag: bytes, payload: bytes) -> None:
