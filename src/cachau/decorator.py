@@ -70,12 +70,17 @@ _EVICTION_MARKER_CAP = 4096
 _MARKER_MISSING = object()
 # coalesce="processes" wait bounds. A waiter with local compute history waits
 # FACTOR x the mean compute (plus a second, capped); a cold worker with no
-# history waits the fixed default. Stale detection is twice the wait with a
-# floor, so a crashed holder's lock is broken well after any live one commits.
+# history waits the fixed default.
 _PROCESS_WAIT_DEFAULT = 60.0
 _PROCESS_WAIT_CAP = 600.0
 _PROCESS_WAIT_FACTOR = 3.0
-_PROCESS_STALE_FLOOR = 120.0
+# Staleness is decoupled from compute time: a held lock's mtime is refreshed
+# every heartbeat (interprocess._HEARTBEAT_SECONDS), so "stale" means the
+# holder stopped BEATING (crashed), not "the compute is taking long". Any
+# compute-derived threshold preempts healthy slow holders — measured
+# downstream as 2 computes instead of 1. Five heartbeats leaves margin for
+# coarse filesystem timestamps.
+_PROCESS_STALE_AFTER = 5.0
 Persist = bool | str | os.PathLike
 # Every tally CacheControl keeps. Naming them once gives stats() an explicit
 # snapshot set and gives _bump() a checkable vocabulary (see the test that
@@ -988,7 +993,7 @@ def _wrap(
             )
         else:
             max_wait = _PROCESS_WAIT_DEFAULT
-        stale_after = max(2.0 * max_wait, _PROCESS_STALE_FLOOR)
+        stale_after = _PROCESS_STALE_AFTER
 
         def probe() -> Any:
             entry = _fresh_entry(key, dep_fingerprints)

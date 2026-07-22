@@ -11,9 +11,9 @@ must never block a caller beyond a bounded wait and never deadlock. Every
 failure mode degrades to the uncoordinated behavior (compute redundantly;
 atomic entry writes keep the store safe):
 
-- the winner crashes → its lock goes stale and is broken by age, and waiters
-  have ALSO been waiting against their own deadline, after which they compute
-  anyway;
+- the winner crashes → its heartbeat stops, the lock goes stale and is broken,
+  and waiters have ALSO been waiting against their own deadline, after which
+  they compute anyway;
 - two waiters break a stale lock together → the exclusive create arbitrates
   exactly one new winner;
 - a foreign process deletes our held lock mid-compute → at most one extra
@@ -21,17 +21,28 @@ atomic entry writes keep the store safe):
 - clock skew between machines misjudges staleness → an early break (duplicate
   compute) or a longer-but-bounded wait, never corruption.
 
-Liveness is judged by lock-file age alone. Pid-based checks are deliberately
+Staleness means "the holder stopped HEARTBEATING", never "the compute is
+taking long". The holder refreshes the lock's mtime every ``_HEARTBEAT_SECONDS``
+from a daemon thread, so the two failure modes separate cleanly: a crashed
+holder stops beating and is recovered within a few heartbeats; a wedged-but-
+alive holder keeps beating, and waiters never touch its lock — they run out
+their own deadline and degrade to computing. Tying staleness to compute time
+instead is a trap the downstream 48-core stress test hit on its first run: any
+fixed threshold below the compute duration preempts a HEALTHY holder (two
+computes instead of one), and any threshold above it slows real-crash recovery.
+
+Liveness is judged by heartbeat age alone. Pid-based checks are deliberately
 absent: there is no portable probe (on Windows, ``os.kill(pid, 0)`` does not
-test the process — it TERMINATES it), and age plus a bounded wait already
-guarantees progress. The pid recorded inside the file is for a human holding
-a stuck directory, nothing else.
+test the process — it TERMINATES it), and the same stress test confirmed
+timestamp-only recovery suffices. The pid recorded inside the file is for a
+human holding a stuck directory, nothing else.
 """
 
 from __future__ import annotations
 
 import os
 import pathlib
+import threading
 import time
 import uuid
 from typing import Any, Callable
@@ -39,6 +50,11 @@ from typing import Any, Callable
 # Distinguishes "no fresh entry yet" from a cached value that is legitimately
 # None. Never leaves this module's callers.
 MISSING = object()
+
+# The holder refreshes its lock's mtime this often. Stale thresholds must sit
+# a few multiples above it (k = 4-5 measured well downstream) with margin for
+# coarse filesystem timestamps; see _PROCESS_STALE_AFTER in decorator.py.
+_HEARTBEAT_SECONDS = 1.0
 
 
 class ProcessLock:
@@ -56,6 +72,8 @@ class ProcessLock:
         self._path = pathlib.Path(path)
         self._token = f"{os.getpid()}:{uuid.uuid4().hex}".encode()
         self._held = False
+        self._heartbeat_stop: threading.Event | None = None
+        self._heartbeat_thread: threading.Thread | None = None
 
     def try_acquire(self) -> bool:
         try:
@@ -71,10 +89,36 @@ class ProcessLock:
         finally:
             os.close(descriptor)
         self._held = True
+        self._start_heartbeat()
         return True
 
+    def _start_heartbeat(self) -> None:
+        # Daemon: dies with the process, which is exactly the signal — a
+        # crashed holder stops beating and its lock goes stale. A live holder
+        # beats even through a long GIL-holding compute (the interpreter
+        # schedules threads every switch interval; only a C extension that
+        # never releases the GIL for several heartbeats could starve this,
+        # and that misjudgment costs one duplicate compute, never a hang).
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread = threading.Thread(
+            target=self._beat, name="cachau-lock-heartbeat", daemon=True
+        )
+        self._heartbeat_thread.start()
+
+    def _beat(self) -> None:
+        assert self._heartbeat_stop is not None
+        while not self._heartbeat_stop.wait(_HEARTBEAT_SECONDS):
+            try:
+                os.utime(self._path)
+            except OSError:
+                return  # lock gone (foreign break): nothing left to keep fresh
+
     def age_seconds(self) -> float | None:
-        """Age of whatever lock file currently exists, or ``None`` if gone."""
+        """Seconds since the holder's last heartbeat, or ``None`` if no lock.
+
+        A held lock's mtime advances every ``_HEARTBEAT_SECONDS``, so age
+        measures silence, not how long the compute has been running.
+        """
         try:
             return max(0.0, time.time() - os.stat(self._path).st_mtime)
         except OSError:
@@ -91,6 +135,8 @@ class ProcessLock:
         if not self._held:
             return
         self._held = False
+        if self._heartbeat_stop is not None:
+            self._heartbeat_stop.set()  # daemon thread exits on its next wake
         try:
             content = self._path.read_bytes()
         except OSError:
