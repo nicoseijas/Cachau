@@ -116,6 +116,30 @@ def test_edited_helper_recomputes_instead_of_false_hit():
         _scale.__code__ = original
 
 
+def test_edited_helper_default_recomputes_instead_of_false_hit():
+    """#50: a default lives on the function object, outside the code object —
+    editing it must invalidate a declared helper just like editing its body."""
+    calls = []
+
+    def _scaled(x, mult=2):
+        return x * mult
+
+    @cache(depends_on=[cachau.code(_scaled)])
+    def estimate(x):
+        calls.append(x)
+        return _scaled(x)
+
+    assert estimate(10) == 20
+    assert estimate(10) == 20
+    assert calls == [10]
+    _scaled.__defaults__ = (3,)  # simulate editing mult=2 -> mult=3 and reloading
+    explanation = estimate.cache.explain(10)
+    assert explanation.outcome == "MISS"
+    assert explanation.reason == "dependency_changed"
+    assert estimate(10) == 30  # recomputed with the new default, not a stale 20
+    assert calls == [10, 10]
+
+
 # --------------------------------------------------------------------------- #
 # profile() flags undeclared helpers
 # --------------------------------------------------------------------------- #

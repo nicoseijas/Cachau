@@ -75,9 +75,12 @@ def function_namespace(func: Callable[..., Any]) -> str:
 def function_fingerprint(func: Callable[..., Any]) -> str:
     """Stable identity for *what the function does*: a digest of its code.
 
-    Covers the code object AND closure-captured values: two functions from
-    the same factory with different captured parameters compute different
-    results and must never share a fingerprint. For JIT dispatchers, the
+    Covers the code object, closure-captured values, and parameter defaults
+    (``__defaults__``/``__kwdefaults__`` live on the function object, outside
+    the code object): two functions from the same factory with different
+    captured parameters — or two versions differing only in a default —
+    compute different results and must never share a fingerprint. For JIT
+    dispatchers, the
     digest additionally covers the semantically relevant compile options
     (``fastmath``, ``parallel``, ..., and ``locals=`` type forcing) —
     changing them changes observable results, so it must invalidate.
@@ -121,17 +124,14 @@ def _fingerprint(func: Callable[..., Any], seen: set[int]) -> str:
 def _feed_function(hasher: Any, func: Callable[..., Any], seen: set[int]) -> None:
     _feed_code(hasher, func.__code__)
     _feed_closure(hasher, func, seen)
+    _feed_defaults(hasher, func, seen)
 
 
 def _feed_closure(hasher: Any, func: Callable[..., Any], seen: set[int]) -> None:
     """Fold closure-captured values into the identity.
 
     Captured values determine results just as arguments do (a factory-made
-    kernel closing over ``n`` computes ``x + n``). Hashable captures use the
-    same type-tagged digest as arguments; captured functions recurse into
-    their own fingerprint; opaque captures fall back to instance identity —
-    stable within the process, deliberately unstable across restarts, so
-    persisted reuse degrades to a safe MISS instead of guessing.
+    kernel closing over ``n`` computes ``x + n``).
     """
     code = func.__code__
     closure = getattr(func, "__closure__", None) or ()
@@ -146,20 +146,56 @@ def _feed_closure(hasher: Any, func: Callable[..., Any], seen: set[int]) -> None
         except ValueError:  # self-referential/unbound cell (recursive def)
             hasher.update(b"<unbound>")
             continue
-        try:
-            hasher.update(_digest_value(contents))
-        except UnhashableArgumentError:
-            if callable(contents) and getattr(contents, "__code__", None) is not None:
-                hasher.update(b"<function:")
-                if id(contents) in seen:  # self/mutually-recursive capture
-                    hasher.update(b"recursive")
-                else:
-                    hasher.update(_fingerprint(contents, seen).encode())
-                hasher.update(b">")
+        _feed_bound_value(hasher, contents, seen)
+
+
+def _feed_defaults(hasher: Any, func: Callable[..., Any], seen: set[int]) -> None:
+    """Fold parameter defaults into the identity (#50).
+
+    A default is evaluated at ``def`` time and stored on the FUNCTION object
+    (``__defaults__``/``__kwdefaults__``), not in the code object — the
+    constant appears in the enclosing scope's ``co_consts``, never in the
+    function's own. Two versions differing only in ``mult=2`` vs ``mult=3``
+    are byte-identical to the code digest, yet compute different results:
+    without this, editing a declared helper's default serves stale values.
+    """
+    defaults = getattr(func, "__defaults__", None) or ()
+    kwdefaults = getattr(func, "__kwdefaults__", None) or {}
+    if defaults:
+        hasher.update(b"|defaults:")
+        for index, value in enumerate(defaults):
+            hasher.update(b"%d=" % index)
+            _feed_bound_value(hasher, value, seen)
+    if kwdefaults:
+        hasher.update(b"|kwdefaults:")
+        for name in sorted(kwdefaults):
+            hasher.update(name.encode())
+            hasher.update(b"=")
+            _feed_bound_value(hasher, kwdefaults[name], seen)
+
+
+def _feed_bound_value(hasher: Any, contents: Any, seen: set[int]) -> None:
+    """One value bound to a function (closure capture or parameter default).
+
+    Hashable values use the same type-tagged digest as arguments; functions
+    recurse into their own fingerprint; opaque values fall back to instance
+    identity — stable within the process, deliberately unstable across
+    restarts, so persisted reuse degrades to a safe MISS instead of guessing.
+    """
+    try:
+        hasher.update(_digest_value(contents))
+    except UnhashableArgumentError:
+        if callable(contents) and getattr(contents, "__code__", None) is not None:
+            hasher.update(b"<function:")
+            if id(contents) in seen:  # self/mutually-recursive reference
+                hasher.update(b"recursive")
             else:
-                hasher.update(
-                    f"<opaque:{type(contents).__qualname__}:{id(contents)}>".encode()
-                )
+                hasher.update(_fingerprint(contents, seen).encode())
+            hasher.update(b">")
+        else:
+            hasher.update(
+                f"<opaque:{type(contents).__qualname__}:{id(contents)}>".encode()
+            )
 
 
 def unwrap_function(func: Callable[..., Any]) -> Callable[..., Any]:
