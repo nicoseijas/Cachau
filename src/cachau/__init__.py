@@ -1,7 +1,7 @@
 """Cachau — delightful function caching for Python data workloads."""
 
 from cachau.decorator import cache
-from cachau.dependencies import env, file, package, token
+from cachau.dependencies import code, env, file, package, token
 from cachau.explanation import Explanation
 from cachau.inspection import CacheEntryView, Inspection
 from cachau.profile import CacheProfile
@@ -21,6 +21,7 @@ __all__ = [
     "env",
     "package",
     "token",
+    "code",
     "CacheStats",
     "CacheProfile",
     "CacheEntryView",

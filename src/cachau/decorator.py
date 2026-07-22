@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterable, TypeVar, overload
 
 from cachau.backend import CacheBackend, CacheEntry, EntryMetadata
 from cachau.dependencies import (
+    CodeDependency,
     LabeledDependency,
     changed_labels,
     fingerprint_dependencies,
@@ -25,6 +26,7 @@ from cachau.fingerprint import (
     function_fingerprint,
     function_namespace,
     is_jit_dispatcher,
+    referenced_global_functions,
 )
 from cachau.inspection import CacheEntryView, Inspection
 from cachau.flight import KeyedLocks
@@ -324,6 +326,16 @@ class CacheControl:
         except Exception:  # noqa: BLE001 - size is informational, never fatal
             size_bytes = None
         largest = largest_data_arg(normalize_call(self._func, args, kwargs))
+        declared_code = {
+            function_namespace(item.dependency.func)
+            for item in self._dependencies
+            if isinstance(item.dependency, CodeDependency)
+        }
+        unfingerprinted = tuple(
+            name
+            for name, helper in referenced_global_functions(self._func)
+            if function_namespace(helper) not in declared_code
+        )
         verdict, primary_cost, recommendation = diagnose(
             compute_seconds=compute_seconds,
             key_seconds=key_seconds,
@@ -341,6 +353,7 @@ class CacheControl:
             verdict=verdict,
             primary_cost=primary_cost,
             recommendation=recommendation,
+            unfingerprinted_calls=unfingerprinted,
         )
 
     def inspect(self) -> Inspection:

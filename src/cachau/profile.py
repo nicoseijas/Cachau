@@ -48,6 +48,10 @@ class CacheProfile:
     verdict: str  # "worth_it" | "marginal" | "not_worth_it"
     primary_cost: str  # human label for the dominant cache-hit cost
     recommendation: str
+    # Same-package module-level functions this call reaches by global lookup
+    # that neither the code fingerprint nor a declared cachau.code() covers —
+    # editing one of them would NOT invalidate cached results.
+    unfingerprinted_calls: tuple[str, ...] = ()
 
     @property
     def hit_seconds(self) -> float:
@@ -97,6 +101,14 @@ class CacheProfile:
             lines.append("Caching and recomputation are about break-even.")
         lines.append(f"{'Primary hit cost:'.ljust(width)}{self.primary_cost}")
         lines.append(f"{'Recommendation:'.ljust(width)}{self.recommendation}")
+        if self.unfingerprinted_calls:
+            names = ", ".join(self.unfingerprinted_calls)
+            lines.append("")
+            lines.append(
+                f"Warning: calls {names} by global lookup; the code fingerprint "
+                "does not cover them, so editing them will NOT invalidate cached "
+                "results. Declare them: depends_on=[cachau.code(...)]"
+            )
         return "\n".join(lines)
 
 
