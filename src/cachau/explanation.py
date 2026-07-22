@@ -33,6 +33,11 @@ class Explanation:
     # a ``None`` side means the dependency was absent then or now. Lets explain()
     # answer not just WHICH dependency changed but HOW.
     dependency_diff: dict[str, tuple[str | None, str | None]] | None = None
+    # Set on a "not_found" miss when this function has already failed cache
+    # writes. A failed write leaves nothing behind to find, so without this a
+    # broken store is indistinguishable from a cold cache. Function-wide tally,
+    # not proof that THIS key's write failed.
+    write_errors: int | None = None
 
     @property
     def age_seconds(self) -> float | None:
@@ -54,6 +59,12 @@ class Explanation:
 
     def __str__(self) -> str:
         lines = [self.outcome, f"Reason:      {self.reason}"]
+        if self.write_errors:
+            plural = "s" if self.write_errors != 1 else ""
+            lines.append(
+                f"Warning:     {self.write_errors} cache write{plural} failed; "
+                "this may be a broken store, not a cold cache"
+            )
         if self.dependency_diff:
             for label, (stored, current) in sorted(self.dependency_diff.items()):
                 before = stored if stored is not None else "<none>"

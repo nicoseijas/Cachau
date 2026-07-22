@@ -47,6 +47,31 @@ def test_miss_not_found():
     assert explanation.created_at is None
 
 
+def test_miss_not_found_surfaces_write_failures(tmp_path):
+    """A miss caused by failing writes must not look like a cold cache."""
+
+    @cache(persist=str(tmp_path))
+    def expensive(x):
+        return lambda: x  # lambdas cannot be pickled: every write fails
+
+    expensive(1)
+    explanation = expensive.cache.explain(1)
+    assert explanation.outcome == "MISS"
+    assert explanation.reason == "not_found"
+    assert explanation.write_errors == 1
+    assert "Warning:     1 cache write failed" in str(explanation)
+
+
+def test_miss_not_found_without_write_failures_has_no_warning():
+    @cache
+    def expensive(x):
+        return x
+
+    explanation = expensive.cache.explain(42)
+    assert explanation.write_errors is None
+    assert "Warning" not in str(explanation)
+
+
 def test_miss_expired_reports_when_it_died():
     clock = FakeClock(now=0.0)
 
