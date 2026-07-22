@@ -46,6 +46,15 @@ class DiskBackend:
     def _path_for(self, key: str) -> pathlib.Path:
         return self._directory / (hashlib.sha256(key.encode()).hexdigest() + _SUFFIX)
 
+    def lock_path(self, key: str) -> pathlib.Path:
+        """Sibling advisory-lock path for cross-process single-flight.
+
+        A distinct suffix keeps locks invisible to every ``*.cachau`` glob
+        (enumeration, namespace clears) and to entry reads. Providing this
+        method is what qualifies a backend for ``coalesce="processes"``.
+        """
+        return self._directory / (hashlib.sha256(key.encode()).hexdigest() + ".lock")
+
     def get(self, key: str) -> CacheEntry | None:
         return self._load(key, remove_corrupt=True)
 
@@ -117,6 +126,11 @@ class DiskBackend:
         if namespace is None:
             for stale_temp in self._directory.glob("*.tmp"):
                 stale_temp.unlink(missing_ok=True)
+            # Locks belong to in-flight computes; on a full clear they are
+            # leftovers at best, and sweeping them saves a future misser the
+            # bounded stale-detection wait.
+            for stale_lock in self._directory.glob("*.lock"):
+                stale_lock.unlink(missing_ok=True)
         for path in self._directory.glob(f"*{_SUFFIX}"):
             if namespace is None:
                 path.unlink(missing_ok=True)

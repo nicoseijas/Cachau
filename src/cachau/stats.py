@@ -44,6 +44,12 @@ class CacheStats:
     # miss_verification_failed).
     verifications: int
     verification_failures: int
+    # coalesce="processes": hits served by waiting on another process's
+    # compute, bounded waits that expired (the caller computed anyway), and
+    # stale lock files broken by age.
+    process_coalesced_hits: int
+    process_flight_timeouts: int
+    stale_locks_broken: int
     total_compute_seconds: float
     estimated_saved_seconds: float
     # First computation of a JIT dispatcher includes one-time compilation;
