@@ -12,6 +12,7 @@ from cachau.errors import (
     ConfigurationError,
     InvalidSizeError,
     InvalidTTLError,
+    MachineCodeCacheWarning,
     UnhashableArgumentError,
 )
 
@@ -29,6 +30,7 @@ __all__ = [
     "Inspection",
     "CachauError",
     "CacheVerificationWarning",
+    "MachineCodeCacheWarning",
     "Explanation",
     "ConfigurationError",
     "InvalidSizeError",

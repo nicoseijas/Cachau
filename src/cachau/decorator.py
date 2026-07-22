@@ -26,6 +26,7 @@ from cachau.durations import parse_ttl
 from cachau.errors import (
     CacheVerificationWarning,
     ConfigurationError,
+    MachineCodeCacheWarning,
     UnhashableArgumentError,
 )
 from cachau.explanation import Explanation
@@ -568,6 +569,20 @@ def cache(
     )
 
 
+def _has_machine_code_cache(func: Any) -> bool:
+    """Whether a dispatcher has numba's on-disk machine-code cache enabled.
+
+    ``cache=True`` is not exposed in ``targetoptions``; numba swaps the
+    dispatcher's ``_cache`` from a NullCache to a FunctionCache carrying a
+    ``cache_path``. That is private API, so this duck-types defensively and
+    answers False on any surprise — a diagnostic must never break decoration.
+    """
+    try:
+        return getattr(getattr(func, "_cache", None), "cache_path", None) is not None
+    except Exception:  # noqa: BLE001 - foreign attribute access, best effort
+        return False
+
+
 def _values_match(cached: Any, fresh: Any) -> tuple[bool, bool]:
     """``(compared, equal)``: content comparison for ``verify=``.
 
@@ -752,6 +767,16 @@ def _wrap(
     resolved_namespace = namespace if namespace is not None else function_namespace(func)
     fingerprint = function_fingerprint(func)
     jit_boundary = is_jit_dispatcher(func)
+    if jit_boundary and _has_machine_code_cache(func):
+        warnings.warn(
+            f"cachau: {resolved_namespace} is compiled with numba cache=True, "
+            f"stacking a machine-code cache under this result cache. The "
+            f"result cache already survives restarts, and the .nbi/.nbc "
+            f"machine-code cache is a known cross-process crash hazard on "
+            f"some platforms; prefer persist= INSTEAD of cache=True.",
+            MachineCodeCacheWarning,
+            stacklevel=3,
+        )
     store: CacheBackend = _resolve_backend(persist, backend)
     budget = LRUBudget(max_memory_bytes) if max_memory_bytes is not None else None
     flights = KeyedLocks()
