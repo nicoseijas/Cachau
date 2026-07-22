@@ -25,10 +25,12 @@ SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
 
 # Small time knobs so the OS-level scenarios run fast but non-flaky: a crashed
 # holder is recovered a few heartbeats after it stops beating; a wedged holder
-# is out-waited within the bounded deadline.
+# is out-waited within the bounded deadline. The wait must comfortably exceed
+# the 0.4s compute plus interpreter-startup skew across K spawned processes,
+# or a cold-burst waiter times out and duplicates the compute on a loaded box.
 _HEARTBEAT = 0.1
 _STALE_AFTER = 0.6
-_WAIT_DEFAULT = 1.0
+_WAIT_DEFAULT = 5.0
 
 _WORKER = """
 import os, pathlib, sys, time, uuid
@@ -169,8 +171,12 @@ def test_real_wedged_holder_forces_bounded_degrade(tmp_path):
         elapsed = time.perf_counter() - started
 
         assert outs == ["42"] * 4              # correct: a wedged holder can't hang callers
-        # holder's marker (1) + all four survivors degraded to computing (4).
-        assert len(_markers(tmp_path)) == 5
+        # Holder's marker (1) + at least one survivor that timed out and
+        # degraded to computing. How many degrade is timing-dependent: the
+        # first degrader COMMITS its result, and any survivor still polling
+        # is served by that commit instead of computing — the mechanism
+        # reducing duplicate compute, which is the invariant, not a count.
+        assert 2 <= len(_markers(tmp_path)) <= 5
         assert _store_locks(tmp_path)          # the live lock is untouched (still the wedged holder's)
         # each survivor waited ~ _WAIT_DEFAULT then computed; nowhere near the holder's 60s sleep.
         assert elapsed < 30
