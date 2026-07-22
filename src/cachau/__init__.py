@@ -6,6 +6,7 @@ from cachau.explanation import Explanation
 from cachau.inspection import CacheEntryView, Inspection
 from cachau.profile import CacheProfile
 from cachau.stats import CacheStats
+from cachau.tokens import array_token
 from cachau.errors import (
     CachauError,
     CacheVerificationWarning,
@@ -24,6 +25,7 @@ __all__ = [
     "package",
     "token",
     "code",
+    "array_token",
     "CacheStats",
     "CacheProfile",
     "CacheEntryView",
