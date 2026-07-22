@@ -124,12 +124,26 @@ class ProcessLock:
         except OSError:
             return None
 
-    def break_stale(self) -> None:
-        """Best-effort removal of a lock presumed dead by age."""
+    def break_stale(self, stale_after: float) -> bool:
+        """Best-effort removal of a lock that is STILL stale; True if removed.
+
+        When a holder dies, every waiter crosses the staleness threshold
+        together, and an unconditional unlink lets a late breaker remove the
+        fresh lock a faster one just re-acquired via break -> O_EXCL — two
+        computers for one key (#58). Re-checking the age immediately before
+        the unlink shrinks that window from the whole measure-to-unlink gap
+        to a stat-to-unlink TOCTOU of microseconds: a just-reacquired lock
+        has age ~0 and is left alone. Losing the residual race stays benign
+        (a bounded duplicate compute, atomic commits, correct values).
+        """
+        age = self.age_seconds()
+        if age is None or age <= stale_after:
+            return False
         try:
             self._path.unlink()
         except OSError:
-            pass
+            return False
+        return True
 
     def release(self) -> None:
         if not self._held:
@@ -180,8 +194,8 @@ def coordinate(
             return "acquired", None, stale_broken
         age = lock.age_seconds()
         if age is not None and age > stale_after:
-            lock.break_stale()
-            stale_broken += 1
+            if lock.break_stale(stale_after):
+                stale_broken += 1
             continue  # retry the acquire immediately; O_EXCL picks one winner
         if monotonic() >= deadline:
             return "timeout", None, stale_broken
