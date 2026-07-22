@@ -78,6 +78,65 @@ def test_captured_functions_recurse_into_their_fingerprint():
     assert function_fingerprint(make(double)) != function_fingerprint(make(triple))
 
 
+def test_positional_defaults_are_part_of_identity():
+    """A default lives on the function object, not in co_consts (#50):
+    editing one changes behavior without touching the bytecode."""
+
+    def before(x, mult=2):
+        return x * mult
+
+    def after(x, mult=3):
+        return x * mult
+
+    def same(x, mult=2):
+        return x * mult
+
+    assert function_fingerprint(before) != function_fingerprint(after)
+    assert function_fingerprint(before) == function_fingerprint(same)
+
+
+def test_keyword_only_defaults_are_part_of_identity():
+    def before(x, *, mult=2):
+        return x * mult
+
+    def after(x, *, mult=3):
+        return x * mult
+
+    assert function_fingerprint(before) != function_fingerprint(after)
+
+
+def test_function_valued_defaults_recurse_into_their_fingerprint():
+    def double(x):
+        return x * 2
+
+    def triple(x):
+        return x * 3
+
+    def with_double(x, fn=double):
+        return fn(x)
+
+    def with_triple(x, fn=triple):
+        return fn(x)
+
+    assert function_fingerprint(with_double) != function_fingerprint(with_triple)
+
+
+def test_opaque_defaults_are_instance_stable():
+    class Opaque:
+        pass
+
+    shared = Opaque()
+
+    def make(obj):
+        def f(x, o=obj):  # default evaluated at def time: lands in __defaults__
+            return (x, o)
+
+        return f
+
+    assert function_fingerprint(make(shared)) == function_fingerprint(make(shared))
+    assert function_fingerprint(make(shared)) != function_fingerprint(make(Opaque()))
+
+
 def test_recursive_function_with_unbound_cell_does_not_crash():
     def make():
         def factorial(n):
