@@ -207,6 +207,20 @@ Recommendation:       Provide an explicit stable key= (e.g. a dataset version)
 
 Here hashing a 30-MB array to build the key costs more than just recomputing the result, so the cache makes things *worse* — and `profile()` says so, names the culprit, and points at the fix. Unlike `explain()`, it runs the function (it must, to measure recompute cost); it doesn't touch `stats()` and restores cache state afterward. Cachau doesn't just cache — it tells you when caching is a bad decision.
 
+### `cachau.testing` — certify it, don't trust it
+
+Observability answers questions; a pipeline that must trust its cache should also *certify* it, in its own test suite:
+
+```python
+from cachau.testing import assert_cache_faithful, assert_invalidates
+
+assert_cache_faithful(build_features, df, config)  # HIT == fresh compute, content-exact
+assert_invalidates(build_features, lambda: bump_schema_version(), df, config,
+                   reason="dependency_changed")
+```
+
+`assert_cache_faithful` fails when a HIT would serve anything other than a fresh compute — a nondeterministic function, an undeclared input, a mutated stored value. `assert_invalidates` fails when the perturbation does **not** turn the entry into a MISS (optionally checking the reason): an invalidation check that cannot fail certifies nothing. Both prime a cold entry, fail loudly if nothing caches at all, and read the cached value straight from the backend so `verify=` sampling cannot mask a divergence. They execute the function — they belong in tests, not on hot paths.
+
 ## The persistent cache directory is a trust boundary
 
 Persisted values are serialized with `pickle`, so **reading** an entry deserializes whatever is on disk. Treat the cache directory the way you treat an importable Python file:
