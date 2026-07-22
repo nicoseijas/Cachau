@@ -568,3 +568,68 @@ def test_no_dependencies_behaves_like_before():
     run(1)
     assert calls == [1]
     assert run.cache.stats().miss_dependency_changed == 0
+
+
+def test_file_appended_during_compute_is_not_cached(tmp_path):
+    """The shared-input near-miss: a dependency file appended while the
+    function runs. The result reflects a torn view of the dependency, so
+    committing it under either fingerprint could later serve it as fresh —
+    cachau refuses to cache it instead."""
+    shared = tmp_path / "shared.jsonl"
+    shared.write_text("row1\n")
+    writer_active = {"on": True}
+    calls = []
+
+    @cache(depends_on=[str(shared)])
+    def load(n):
+        calls.append(n)
+        if writer_active["on"]:  # another process appends mid-compute
+            with open(shared, "a", encoding="utf-8") as handle:
+                handle.write("row2\n")
+        return shared.read_text()
+
+    assert load(1) == "row1\nrow2\n"
+    stats = load.cache.stats()
+    assert stats.dependency_race_skips == 1
+    assert stats.writes == 0  # refused: no stable fingerprint describes it
+    writer_active["on"] = False  # the writer stops; the file is stable again
+    assert load(1) == "row1\nrow2\n"  # recompute (nothing was cached), commits
+    assert load(1) == "row1\nrow2\n"  # served from cache
+    assert calls == [1, 1]
+    assert load.cache.stats().writes == 1
+
+
+def test_depends_on_validates_one_entry_it_does_not_version():
+    """Flipping a token v1 -> v2 -> v1 re-misses every time: depends_on
+    re-validates the single entry per key, it retains nothing per version.
+    Provenance whose results must be RETAINED belongs in the key."""
+    provenance = {"v": "v1"}
+    calls = []
+
+    @cache(depends_on=[cachau.token(lambda: provenance["v"], name="prov")])
+    def solve(x):
+        calls.append(provenance["v"])
+        return (x, provenance["v"])
+
+    solve(1)
+    provenance["v"] = "v2"
+    solve(1)
+    provenance["v"] = "v1"
+    solve(1)  # back to v1: STILL a miss — the v1 result was not retained
+    assert calls == ["v1", "v2", "v1"]
+    assert solve.cache.stats().miss_dependency_changed == 2
+
+    # The retaining alternative: provenance in the KEY, one entry per version.
+    keyed_calls = []
+
+    @cache(key=lambda x: (x, provenance["v"]))
+    def solve_keyed(x):
+        keyed_calls.append(provenance["v"])
+        return (x, provenance["v"])
+
+    solve_keyed(1)
+    provenance["v"] = "v2"
+    solve_keyed(1)
+    provenance["v"] = "v1"
+    assert solve_keyed(1) == (1, "v1")  # HIT: the v1 entry was retained
+    assert keyed_calls == ["v1", "v2"]

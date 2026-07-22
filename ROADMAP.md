@@ -88,6 +88,7 @@ Goal: broaden supported types with the same correctness bar. Nothing is "support
 - [ ] Mutation policy: detect-and-reject where possible, documented opt-in otherwise
 - [x] Transitive code changes, declared mitigation (#27): `cachau.code(helper)` fingerprints a callable's implementation as a dependency, and `profile()` flags same-package module-level functions called by global lookup that are neither closure-captured nor declared
 - [ ] Opt-in call-graph fingerprinting: automatic transitive invalidation without declaring each helper
+- [ ] Cross-process single-flight (#35): N processes missing the same key currently all compute it (atomic writes make this waste, never corruption); dedup needs advisory locking with stale-holder recovery — design before code
 - [x] `verify=` mode (#28): sample-recompute HITs and compare by content; a mismatch warns (`CacheVerificationWarning`), counts as `miss_verification_failed`, and the fresh value replaces the entry — catches both transitive-code false HITs and nondeterminism
 - [ ] Cross-machine portability of persisted results (semantic identity, not compilation-artifact identity)
 
