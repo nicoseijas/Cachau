@@ -38,6 +38,7 @@ from cachau.fingerprint import (
 )
 from cachau.inspection import CacheEntryView, Inspection
 from cachau.flight import KeyedLocks
+from cachau.interprocess import MISSING, ProcessLock, coordinate
 import inspect
 
 from cachau.keys import (
@@ -67,6 +68,14 @@ _INVALIDATION_MARKER_CAP = 4096
 # simply loses that annotation for the oldest evicted key, never any correctness.
 _EVICTION_MARKER_CAP = 4096
 _MARKER_MISSING = object()
+# coalesce="processes" wait bounds. A waiter with local compute history waits
+# FACTOR x the mean compute (plus a second, capped); a cold worker with no
+# history waits the fixed default. Stale detection is twice the wait with a
+# floor, so a crashed holder's lock is broken well after any live one commits.
+_PROCESS_WAIT_DEFAULT = 60.0
+_PROCESS_WAIT_CAP = 600.0
+_PROCESS_WAIT_FACTOR = 3.0
+_PROCESS_STALE_FLOOR = 120.0
 Persist = bool | str | os.PathLike
 # Every tally CacheControl keeps. Naming them once gives stats() an explicit
 # snapshot set and gives _bump() a checkable vocabulary (see the test that
@@ -94,6 +103,9 @@ TALLY_NAMES = (
     "cold_compute_seconds",
     "verifications",
     "verification_failures",
+    "process_coalesced_hits",
+    "process_flight_timeouts",
+    "stale_locks_broken",
 )
 
 
@@ -146,6 +158,9 @@ class CacheControl:
         self.cold_compute_seconds = 0.0
         self.verifications = 0
         self.verification_failures = 0
+        self.process_coalesced_hits = 0
+        self.process_flight_timeouts = 0
+        self.stale_locks_broken = 0
         # Reason markers: the delete succeeded; remembering the key only
         # attributes the next miss to miss_invalidated. Bounded LRU-style.
         self._invalidation_markers: OrderedDict[str, None] = OrderedDict()
@@ -496,6 +511,9 @@ class CacheControl:
             cold_compute_seconds=tally["cold_compute_seconds"],
             verifications=tally["verifications"],
             verification_failures=tally["verification_failures"],
+            process_coalesced_hits=tally["process_coalesced_hits"],
+            process_flight_timeouts=tally["process_flight_timeouts"],
+            stale_locks_broken=tally["stale_locks_broken"],
         )
 
     def _iter_metadata(self) -> Iterable[EntryMetadata]:
@@ -520,6 +538,7 @@ def cache(
     clock: Clock = ...,
     size_of: SizeOf = ...,
     verify: int | float = 0.0,
+    coalesce: str = "threads",
 ) -> Callable[[F], F]: ...
 
 
@@ -537,6 +556,7 @@ def cache(
     clock: Clock = time.time,
     size_of: SizeOf = estimate_size,
     verify: int | float = 0.0,
+    coalesce: str = "threads",
 ) -> Any:
     """Cache a function's results, keyed by its normalized arguments.
 
@@ -557,15 +577,19 @@ def cache(
     (``CacheVerificationWarning``), counts as ``miss_verification_failed``, and
     the fresh value replaces the entry — the safety net for transitive code
     changes the fingerprint cannot see and for nondeterministic functions.
+    ``coalesce="processes"`` (with a persistent store) extends the same-key
+    single-flight across processes with advisory lock files: concurrent
+    workers missing one key elect a single computer and the rest wait —
+    bounded, so a crashed or wedged holder can never hang a caller.
     """
     if func is not None:
         return _wrap(
             func, ttl, max_memory, persist, namespace, key, ignore, depends_on,
-            backend, clock, size_of, verify,
+            backend, clock, size_of, verify, coalesce,
         )
     return lambda f: _wrap(
         f, ttl, max_memory, persist, namespace, key, ignore, depends_on, backend,
-        clock, size_of, verify,
+        clock, size_of, verify, coalesce,
     )
 
 
@@ -747,6 +771,7 @@ def _wrap(
     clock: Clock,
     size_of: SizeOf,
     verify: int | float = 0.0,
+    coalesce: str = "threads",
 ) -> Callable[..., Any]:
     # Fail fast: bad configuration breaks at decoration time, not on first call.
     if key is not None and ignore:
@@ -778,6 +803,17 @@ def _wrap(
             stacklevel=3,
         )
     store: CacheBackend = _resolve_backend(persist, backend)
+    if coalesce not in ("threads", "processes"):
+        raise ConfigurationError(
+            f"coalesce= must be 'threads' or 'processes', got {coalesce!r}"
+        )
+    process_flight = coalesce == "processes"
+    if process_flight and not hasattr(store, "lock_path"):
+        raise ConfigurationError(
+            "coalesce='processes' needs a shared on-disk store to hold its "
+            "lock files: enable persist= (or pass a backend that provides "
+            "lock_path())"
+        )
     budget = LRUBudget(max_memory_bytes) if max_memory_bytes is not None else None
     flights = KeyedLocks()
     # One pass over the store for both decoration-time chores: decoration
@@ -899,6 +935,70 @@ def _wrap(
         served = serve_if_fresh(key, dep_fingerprints, coalesced=True)
         if served is not _NOT_SERVED:
             return served
+        if not process_flight:
+            return _classify_and_compute(key, args, kwargs, dep_fingerprints)
+        lock = ProcessLock(store.lock_path(key))
+        outcome, coalesced_value, stale_broken = _join_process_flight(
+            lock, key, dep_fingerprints
+        )
+        if stale_broken:
+            control._bump("stale_locks_broken", stale_broken)
+        if outcome == "served":
+            control._record_hit(coalesced=False)
+            control._bump("process_coalesced_hits")
+            if budget is not None:
+                budget.touch(key)
+            return coalesced_value
+        if outcome == "timeout":
+            control._bump("process_flight_timeouts")
+        held = lock if outcome == "acquired" else None
+        try:
+            # A commit may have landed between the flight's last poll and
+            # here. The classification below treats any surviving entry as
+            # stale and deletes it, so a fresh one must be served now.
+            entry = _fresh_entry(key, dep_fingerprints)
+            if entry is not None:
+                control._record_hit(coalesced=False)
+                control._bump("process_coalesced_hits")
+                if budget is not None:
+                    budget.touch(key)
+                return entry.value
+            return _classify_and_compute(key, args, kwargs, dep_fingerprints)
+        finally:
+            if held is not None:
+                held.release()
+
+    def _join_process_flight(
+        lock: ProcessLock, key: str, dep_fingerprints: dict[str, str] | None
+    ) -> tuple[str, Any, int]:
+        """Elect one computer across processes, or wait — bounded — to be served.
+
+        Wait bounds derive from this function's own observed compute time: a
+        100 ms function deserves a short wait, a two-minute one deserves
+        patience. A cold worker with no local history yet uses the fixed
+        default; either way the wait is bounded, so a crashed or wedged
+        holder can cost latency, never a hang.
+        """
+        with control._counter_guard:
+            count = control.compute_count
+            total = control.total_compute_seconds
+        if count:
+            max_wait = min(
+                _PROCESS_WAIT_FACTOR * (total / count) + 1.0, _PROCESS_WAIT_CAP
+            )
+        else:
+            max_wait = _PROCESS_WAIT_DEFAULT
+        stale_after = max(2.0 * max_wait, _PROCESS_STALE_FLOOR)
+
+        def probe() -> Any:
+            entry = _fresh_entry(key, dep_fingerprints)
+            return MISSING if entry is None else entry.value
+
+        return coordinate(lock, probe, max_wait=max_wait, stale_after=stale_after)
+
+    def _classify_and_compute(
+        key: str, args: tuple, kwargs: dict, dep_fingerprints: dict[str, str] | None
+    ) -> Any:
         if key in control._pending_invalidations:
             # Authoritative: the caller invalidated this key but the physical
             # delete failed. Never serve the backend's stale entry; retry the
