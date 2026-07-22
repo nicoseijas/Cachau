@@ -311,3 +311,75 @@ def test_rehydration_tolerates_entries_without_a_recorded_size(tmp_path):
     bounded = _define_sized(tmp_path, 250)
     assert bounded("b") == "b"  # decoration and use must not crash
     assert bounded.cache.stats().current_bytes <= 250
+
+
+# --------------------------------------------------------------------------- #
+# The bound must hold under cross-key concurrency (#52)
+# --------------------------------------------------------------------------- #
+
+
+def test_concurrent_distinct_keys_cannot_orphan_past_the_bound(tmp_path):
+    """admit -> delete -> set let another thread evict-and-delete a key whose
+    file did not exist yet; the later set landed it untracked — an orphan no
+    eviction could ever target. Disk grew without bound (960 files against a
+    ~5-entry budget in the repro)."""
+    import pathlib
+    import threading
+
+    from cachau import cache
+
+    @cache(persist=str(tmp_path), max_memory=1200)
+    def build(k):
+        return "x" * 100 + str(k)
+
+    def worker(offset):
+        for i in range(40):
+            build(offset + i)
+
+    threads = [threading.Thread(target=worker, args=(t * 40,)) for t in range(12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    files = list(pathlib.Path(tmp_path).glob("*.cachau"))
+    stats = build.cache.stats()
+    # Every file on disk is tracked by the budget (the safe direction is a
+    # tracked-but-deleted phantom, which self-heals on the next commit).
+    assert len(files) <= stats.entries
+    assert stats.current_bytes <= 1200
+
+
+def test_failed_write_does_not_evict_healthy_entries():
+    """#52 collateral: making room for an entry that never lands must not
+    cost entries that were serving hits."""
+    from cachau import cache
+    from cachau.memory import MemoryBackend
+
+    class FailingSet(MemoryBackend):
+        def __init__(self):
+            super().__init__()
+            self.fail = False
+
+        def set(self, key, entry):
+            if self.fail:
+                raise OSError("disk full")
+            super().set(key, entry)
+
+    backend = FailingSet()
+
+    @cache(backend=backend, max_memory=500)
+    def build(k):
+        return "x" * 100 + str(k)
+
+    for i in range(3):
+        build(i)
+    healthy = build.cache.stats().entries
+    assert healthy > 0
+    assert build.cache.stats().current_bytes > 300  # near-full: admit must evict
+    backend.fail = True
+    assert build(99) == "x" * 100 + "99"  # the value is never lost
+    backend.fail = False
+    stats = build.cache.stats()
+    assert stats.evictions == 0
+    assert stats.entries == healthy  # nobody was sacrificed for a failed write
