@@ -82,6 +82,13 @@ def _walk(value: Any, seen: set[int]) -> int:
         except Exception:  # noqa: BLE001 - fall through to generic estimation
             pass
 
+    estimated = getattr(value, "estimated_size", None)
+    if callable(estimated):  # polars DataFrame/Series duck-typing
+        try:
+            return int(estimated()) + sys.getsizeof(value, _DEFAULT_OBJECT_SIZE)
+        except Exception:  # noqa: BLE001 - fall through to generic estimation
+            pass
+
     nbytes = getattr(value, "nbytes", None)
     if isinstance(nbytes, int) and not isinstance(nbytes, bool):  # NumPy duck-typing
         return nbytes + sys.getsizeof(value, _DEFAULT_OBJECT_SIZE)

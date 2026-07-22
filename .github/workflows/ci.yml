@@ -28,7 +28,7 @@ jobs:
         # Not fatal: Numba routinely lags a new CPython by months, and losing
         # that matrix should degrade coverage, not block the build.
         continue-on-error: true
-        run: pip install numpy pandas numba
+        run: pip install numpy pandas polars numba
       - name: Tests
         run: pytest -q
 
@@ -78,7 +78,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install
-        run: pip install -e .[dev] numpy pandas numba
+        run: pip install -e .[dev] numpy pandas polars numba
       - name: Run examples
         run: |
           python examples/01_quickstart.py

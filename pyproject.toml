@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Nicolás Seijas", email = "nicoseijas@gmail.com" }]
-keywords = ["cache", "caching", "memoization", "data-science", "numpy", "pandas", "numba"]
+keywords = ["cache", "caching", "memoization", "data-science", "numpy", "pandas", "polars", "numba"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",

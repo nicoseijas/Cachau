@@ -145,6 +145,7 @@ def largest_data_arg(bound: tuple[tuple[str, Any], ...]) -> tuple[str, int] | No
     """
     np = sys.modules.get("numpy")
     pd = sys.modules.get("pandas")
+    plr = sys.modules.get("polars")
     best: tuple[str, int] | None = None
     for _, value in bound:
         label: str | None = None
@@ -156,6 +157,9 @@ def largest_data_arg(bound: tuple[tuple[str, Any], ...]) -> tuple[str, int] | No
             nbytes = int(value.memory_usage(deep=True).sum()) if isinstance(
                 value, pd.DataFrame
             ) else int(value.memory_usage(deep=True))
+            label = f"{type(value).__name__}[{_format_bytes(nbytes)}]"
+        elif plr is not None and isinstance(value, (plr.DataFrame, plr.Series)):
+            nbytes = int(value.estimated_size())
             label = f"{type(value).__name__}[{_format_bytes(nbytes)}]"
         if label is not None and (best is None or nbytes > best[1]):
             best = (label, nbytes)
