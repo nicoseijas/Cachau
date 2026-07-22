@@ -324,5 +324,12 @@ def _read_entry(
         return _entry_from_metadata(metadata, value)
     except Exception:  # noqa: BLE001 - any corruption degrades to a controlled miss
         if remove_corrupt:
-            path.unlink(missing_ok=True)
+            # Best-effort cleanup: on Windows, unlinking a file another handle
+            # holds open raises PermissionError. The corrupt file surviving is
+            # fine — every future read still answers MISS — but the exception
+            # escaping would turn a cache READ into a user-facing error (#53).
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
         return None

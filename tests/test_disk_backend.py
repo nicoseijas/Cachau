@@ -230,3 +230,41 @@ def test_peek_leaves_wrong_typed_metadata_on_disk(tmp_path):
     rewrite_metadata(path, expires_at="bad")
     assert backend.peek("k") is None
     assert path.exists()
+
+
+def test_undeletable_corrupt_file_still_degrades_to_miss(tmp_path, monkeypatch):
+    """#53: on Windows, unlinking a corrupt file another handle holds open
+    raises PermissionError. Cleanup is best-effort; the read must stay a MISS,
+    never a user-facing error."""
+    import pathlib
+
+    backend = DiskBackend(tmp_path)
+    backend.set("k", entry(1))
+    (path,) = list(tmp_path.glob("*.cachau"))
+    path.write_bytes(b"cachau-entry/999 garbage\n")
+
+    original_unlink = pathlib.Path.unlink
+
+    def locked_unlink(self, missing_ok=False):
+        if self.suffix == ".cachau":
+            raise PermissionError(5, "file in use by another process")
+        return original_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", locked_unlink)
+    assert backend.get("k") is None  # controlled MISS, not PermissionError
+    assert path.exists()  # cleanup deferred until the holder lets go
+
+
+def test_corrupt_file_held_open_degrades_to_miss(tmp_path):
+    """Same scenario with a real open handle (bites on Windows, where the CRT
+    opens without FILE_SHARE_DELETE; harmless elsewhere)."""
+    import sys
+
+    backend = DiskBackend(tmp_path)
+    backend.set("k", entry(1))
+    (path,) = list(tmp_path.glob("*.cachau"))
+    path.write_bytes(b"cachau-entry/999 garbage\n")
+    with open(path, "rb"):
+        assert backend.get("k") is None
+        if sys.platform == "win32":
+            assert path.exists()
