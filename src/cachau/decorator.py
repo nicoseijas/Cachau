@@ -340,22 +340,32 @@ class CacheControl:
         cheap_repeats = max(repeats, 20)
         key_seconds = measure(lambda: self._key_builder(*args, **kwargs), cheap_repeats)
         existed = self._backend.get(key) is not None
+        wrote_throwaway = False
         if not existed:
-            self._backend.set(
-                key,
-                CacheEntry(
-                    value=value,
-                    namespace=self.namespace,
-                    created_at=self._now(),
-                    dependency_fingerprints=fingerprint_dependencies(
-                        self._dependencies
+            # The throwaway write is measurement scaffolding, not the product:
+            # a backend that rejects it (locked path on Windows, permissions)
+            # must not leak out of a diagnostic call (#53). Degraded, the read
+            # measurement below times a miss lookup — cheaper than a real HIT,
+            # which can only understate the cache's cost, never oversell it.
+            try:
+                self._backend.set(
+                    key,
+                    CacheEntry(
+                        value=value,
+                        namespace=self.namespace,
+                        created_at=self._now(),
+                        dependency_fingerprints=fingerprint_dependencies(
+                            self._dependencies
+                        ),
                     ),
-                ),
-            )
+                )
+                wrote_throwaway = True
+            except Exception:  # noqa: BLE001 - diagnostics degrade, never raise
+                pass
         try:
             read_seconds = measure(lambda: self._backend.get(key), cheap_repeats)
         finally:
-            if not existed:
+            if wrote_throwaway:
                 try:
                     self._backend.delete(key)
                 except Exception:  # noqa: BLE001 - measurement cleanup, best effort
