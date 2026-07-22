@@ -100,6 +100,16 @@ def process(dataset, version):
     ...
 ```
 
+**Big immutable array arguments: token, not content-hash.** By default every lookup hashes every argument — for a large array that is immutable for the whole run (a lookup table, a canonical index map), that pays the same hashing cost on every single call, and `profile()` will name it as the dominant hit cost. `cachau.array_token(arr)` hashes the content once per live object and reuses the digest inside an explicit `key=`:
+
+```python
+@cache(key=lambda table, n: (cachau.array_token(table), n))
+def lookup(table, n):
+    ...
+```
+
+Measured on a 134 459-element float64 array: content-hash HIT 600 µs vs token-key HIT 3.4 µs. The memo is identity-safe (weakref-checked, so a recycled `id()` can never resurrect a dead object's digest); the caller's side of the contract is that the array is not mutated in place while the token is in use.
+
 Declare external inputs a result depends on, and Cachau invalidates when they change:
 
 ```python
