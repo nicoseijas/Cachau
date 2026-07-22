@@ -33,3 +33,13 @@ class CacheVerificationWarning(UserWarning):
     nondeterministic. The cache never serves the mismatched value — it is
     replaced and the call returns the fresh result.
     """
+
+
+class MachineCodeCacheWarning(UserWarning):
+    """The wrapped dispatcher also carries numba's on-disk machine-code cache.
+
+    ``@cache`` over ``@njit(cache=True)`` stacks two caches. Cachau's result
+    cache already survives restarts, and numba's ``.nbi``/``.nbc`` cache is a
+    known cross-process crash hazard on some platforms — prefer ``persist=``
+    INSTEAD of ``cache=True``, not on top of it.
+    """

@@ -211,12 +211,16 @@ def test_parallel_executes_correctly_at_the_boundary():
 @pytest.mark.filterwarnings("ignore::numba.core.errors.NumbaWarning")
 def test_coexists_with_numba_compilation_cache(tmp_path):
     """Cachau caches results; njit(cache=True) caches machine code. A Cachau
-    MISS still executes fine with Numba's compilation cache active."""
+    MISS still executes fine with Numba's compilation cache active — but the
+    stacked configuration is advised against (see MachineCodeCacheWarning)."""
+    from cachau import MachineCodeCacheWarning
 
-    @cache(persist=str(tmp_path))
-    @njit(cache=True)
-    def triple(x):
-        return x * 3.0
+    with pytest.warns(MachineCodeCacheWarning):
+
+        @cache(persist=str(tmp_path))
+        @njit(cache=True)
+        def triple(x):
+            return x * 3.0
 
     assert triple(2.0) == 6.0
     assert triple(2.0) == 6.0
@@ -446,3 +450,46 @@ def test_plain_python_functions_report_no_cold_jit():
 
     plain(1)
     assert plain.cache.stats().cold_compute_seconds == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Stacked machine-code cache hazard (#32)
+# ---------------------------------------------------------------------------
+
+
+def test_decorating_a_cache_true_dispatcher_warns():
+    from cachau import MachineCodeCacheWarning
+
+    @njit(cache=True)
+    def kernel(x):
+        return x * 2.0
+
+    with pytest.warns(MachineCodeCacheWarning):
+        cache(kernel)
+
+
+def test_decorating_a_plain_dispatcher_does_not_warn():
+    import warnings as warnings_module
+
+    from cachau import MachineCodeCacheWarning
+
+    @njit
+    def kernel(x):
+        return x * 2.0
+
+    with warnings_module.catch_warnings():
+        warnings_module.simplefilter("error", MachineCodeCacheWarning)
+        cache(kernel)
+
+
+def test_decorating_a_plain_function_does_not_warn():
+    import warnings as warnings_module
+
+    from cachau import MachineCodeCacheWarning
+
+    def plain(x):
+        return x * 2.0
+
+    with warnings_module.catch_warnings():
+        warnings_module.simplefilter("error", MachineCodeCacheWarning)
+        cache(plain)

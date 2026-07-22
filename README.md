@@ -229,7 +229,7 @@ def simulate(values, iterations):
     ...
 ```
 
-Cachau caches **results** at the Python → dispatcher boundary (`@cache` goes below `@njit`); Numba's `cache=True` caches **machine code**. They compose: a Cachau HIT skips execution entirely, and a MISS still benefits from Numba's compilation cache. Dispatcher identity covers the Python function, closure captures, and semantically relevant compile options (`fastmath`, `parallel`, `boundscheck`, `error_model`, `locals=` type forcing) — changing any of them invalidates stale results. Metrics are honest about JIT: each specialization's first compile is reported as `cold_compute_seconds` and never counted as normal execution cost. Validated by a 26-test matrix.
+Cachau caches **results** at the Python → dispatcher boundary (`@cache` goes below `@njit`); Numba's `cache=True` caches **machine code**. Use Cachau's result cache **instead of** `cache=True`, not on top of it: `persist=` already survives restarts, and Numba's on-disk `.nbi`/`.nbc` cache has produced hard-to-diagnose cross-process crashes on multi-process Windows farms — stacking the two keeps that hazard while adding nothing the result cache doesn't provide. Decorating a `cache=True` dispatcher emits a `MachineCodeCacheWarning`. Dispatcher identity covers the Python function, closure captures, and semantically relevant compile options (`fastmath`, `parallel`, `boundscheck`, `error_model`, `locals=` type forcing) — changing any of them invalidates stale results. Metrics are honest about JIT: each specialization's first compile is reported as `cold_compute_seconds` and never counted as normal execution cost. Validated by a 26-test matrix.
 
 ### Works with [numba-utils](https://github.com/nicoseijas/numba-utils)
 
