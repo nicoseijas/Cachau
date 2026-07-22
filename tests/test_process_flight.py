@@ -237,15 +237,19 @@ def test_heartbeat_prevents_preemption_of_a_healthy_slow_holder(
     threshold, a waiter declares a healthy still-computing holder's lock stale
     and preempts it (2 computes instead of 1). The heartbeat keeps a live
     holder's lock fresh no matter how long the compute runs."""
-    monkeypatch.setattr("cachau.interprocess._HEARTBEAT_SECONDS", 0.05)
-    monkeypatch.setattr("cachau.decorator._PROCESS_STALE_AFTER", 0.3)
+    # Margins sized for loaded CI runners: a false break needs the holder's
+    # heartbeat thread starved past 1.5s (seen flaking at 0.3s), while the
+    # discriminating power is intact — without the heartbeat the lock's age
+    # reaches the full 3s compute, well past the threshold, deterministically.
+    monkeypatch.setattr("cachau.interprocess._HEARTBEAT_SECONDS", 0.1)
+    monkeypatch.setattr("cachau.decorator._PROCESS_STALE_AFTER", 1.5)
     computes = []
 
     def make():  # two functions, same namespace+body: same key, separate flights
         @cache(persist=str(tmp_path), coalesce="processes", namespace="shared")
         def f(x):
             computes.append(x)
-            time.sleep(1.0)  # far longer than the stale threshold
+            time.sleep(3.0)  # far longer than the stale threshold
             return x * 2
 
         return f
@@ -254,7 +258,7 @@ def test_heartbeat_prevents_preemption_of_a_healthy_slow_holder(
     results = {}
     holder = threading.Thread(target=lambda: results.setdefault("h", holder_fn(1)))
     holder.start()
-    time.sleep(0.3)  # let the holder win the lock and get deep into computing
+    time.sleep(0.5)  # let the holder win the lock and get deep into computing
     results["w"] = waiter_fn(1)
     holder.join()
     assert results == {"h": 2, "w": 2}
@@ -284,3 +288,34 @@ def test_heartbeat_stops_on_release(tmp_path, monkeypatch):
     lock.release()
     lock._heartbeat_thread.join(2.0)
     assert not lock._heartbeat_thread.is_alive()
+
+
+# --------------------------------------------------------------------------- #
+# Stale-break re-check: never break a just-reacquired fresh lock (#58)
+# --------------------------------------------------------------------------- #
+
+
+def test_break_stale_skips_a_lock_that_became_fresh_again(tmp_path):
+    """Thundering-break window: waiter C measures the DEAD holder's lock as
+    stale, but before C unlinks, waiter A breaks it and re-acquires. C must
+    re-check and leave A's fresh lock alone, or two processes compute."""
+    lock_path = tmp_path / "key.lock"
+    lock_path.write_text("fresh new holder")  # A's re-acquired lock, mtime now
+    lock = ProcessLock(lock_path)
+    assert lock.break_stale(stale_after=5.0) is False
+    assert lock_path.exists()
+
+
+def test_break_stale_removes_a_lock_that_is_still_stale(tmp_path):
+    lock_path = tmp_path / "key.lock"
+    lock_path.write_text("crashed holder")
+    long_dead = time.time() - 10_000
+    os.utime(lock_path, (long_dead, long_dead))
+    lock = ProcessLock(lock_path)
+    assert lock.break_stale(stale_after=5.0) is True
+    assert not lock_path.exists()
+
+
+def test_break_stale_handles_a_lock_that_vanished(tmp_path):
+    lock = ProcessLock(tmp_path / "gone.lock")
+    assert lock.break_stale(stale_after=5.0) is False
