@@ -16,10 +16,11 @@ results as arguments.
 
 from __future__ import annotations
 
+import dis
 import hashlib
 import sys
 import types
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from cachau.errors import ConfigurationError, UnhashableArgumentError
 from cachau.keys import _digest_value
@@ -184,15 +185,22 @@ def unwrap_function(func: Callable[..., Any]) -> Callable[..., Any]:
 def referenced_global_functions(
     func: Callable[..., Any],
 ) -> tuple[tuple[str, Callable[..., Any]], ...]:
-    """Same-package module-level functions the code calls by global lookup.
+    """First-party module-level functions the code calls by global lookup.
 
     These are exactly the calls the fingerprint does NOT cover (see the module
-    docstring): editing one changes results without invalidating. Scans
-    ``co_names`` of the code object and every nested code object (lambdas,
-    inner defs), resolving each name in the function's globals. Only
-    first-party helpers are reported — the same module, or a module that is
-    neither stdlib nor installed under site-packages — because only the user's
-    own code changes underfoot; installed code is ``cachau.package()``
+    docstring): editing one changes results without invalidating. Two lookup
+    styles are detected across the code object and every nested code object
+    (lambdas, inner defs, comprehensions):
+
+    - bare names (``from mod import helper; helper()``) via ``co_names``
+      resolved in the function's globals;
+    - attribute chains rooted at a module (``import mod; mod.helper()``,
+      ``pkg.sub.helper()``) via adjacent ``LOAD_GLOBAL``/``LOAD_ATTR``
+      instruction runs, reported as dotted names (#48).
+
+    Only first-party helpers are reported — the same module, or a module that
+    is neither stdlib nor installed under site-packages — because only the
+    user's own code changes underfoot; installed code is ``cachau.package()``
     territory. A heuristic for nudging, never for correctness decisions.
     """
     parts = _dispatcher_parts(func)
@@ -204,21 +212,93 @@ def referenced_global_functions(
     own_module = getattr(target, "__module__", "") or ""
     found: dict[str, Callable[..., Any]] = {}
     for name in sorted(_all_code_names(code)):
-        value = module_globals.get(name)
-        if value is None or not callable(value):
+        resolved = _first_party_function(
+            module_globals.get(name), target, func, own_module
+        )
+        if resolved is not None:
+            found[name] = resolved
+    for base, attrs in sorted(_attribute_chains(code)):
+        root = module_globals.get(base)
+        if not isinstance(root, types.ModuleType):
             continue
-        resolved = unwrap_function(value)
-        if is_jit_dispatcher(resolved):
-            resolved = resolved.py_func
-        if not isinstance(resolved, types.FunctionType):
-            continue
-        if resolved is target or resolved is func:
-            continue  # recursion is the function's own, already fingerprinted
-        module = getattr(resolved, "__module__", "") or ""
-        if module != own_module and not _is_first_party_module(module):
-            continue
-        found[name] = resolved
-    return tuple(found.items())
+        label_parts = [base]
+        current: Any = root
+        for attr in attrs:
+            if not isinstance(current, types.ModuleType):
+                break
+            try:
+                current = getattr(current, attr)
+            except Exception:  # noqa: BLE001 - PEP 562 module __getattr__ may raise
+                current = None
+                break
+            label_parts.append(attr)
+        resolved = _first_party_function(current, target, func, own_module)
+        if resolved is not None:
+            found[".".join(label_parts)] = resolved
+    return tuple(sorted(found.items()))
+
+
+def _first_party_function(
+    value: Any,
+    target: Callable[..., Any],
+    func: Callable[..., Any],
+    own_module: str,
+) -> types.FunctionType | None:
+    """The plain first-party function behind ``value``, or None to stay quiet."""
+    if value is None or not callable(value):
+        return None
+    resolved = unwrap_function(value)
+    if is_jit_dispatcher(resolved):
+        resolved = resolved.py_func
+    if not isinstance(resolved, types.FunctionType):
+        return None
+    if resolved is target or resolved is func:
+        return None  # recursion is the function's own, already fingerprinted
+    module = getattr(resolved, "__module__", "") or ""
+    if module != own_module and not _is_first_party_module(module):
+        return None
+    return resolved
+
+
+def _attribute_chains(code: types.CodeType) -> set[tuple[str, tuple[str, ...]]]:
+    """(global name, attribute chain) pairs, e.g. ``("mod", ("helper",))``.
+
+    A chain is an uninterrupted instruction run ``LOAD_GLOBAL`` then one or
+    more ``LOAD_ATTR``/``LOAD_METHOD`` — the compilation of ``mod.helper``
+    and ``pkg.sub.helper`` on every supported CPython (3.12 folded
+    LOAD_METHOD into LOAD_ATTR; adjacency is unchanged). Any other opcode
+    ends the chain, so ``mod.helper(x).bit_length`` stops at ``helper``:
+    the CALL breaks adjacency before ``bit_length``.
+    """
+    chains: set[tuple[str, tuple[str, ...]]] = set()
+    for code_obj in _walk_code(code):
+        base: str | None = None
+        attrs: list[str] = []
+
+        def flush() -> None:
+            nonlocal base, attrs
+            if base is not None and attrs:
+                chains.add((base, tuple(attrs)))
+            base, attrs = None, []
+
+        for instruction in dis.get_instructions(code_obj):
+            if instruction.opname == "LOAD_GLOBAL":
+                flush()
+                base = instruction.argval
+            elif instruction.opname in ("LOAD_ATTR", "LOAD_METHOD"):
+                if base is not None:
+                    attrs.append(instruction.argval)
+            else:
+                flush()
+        flush()
+    return chains
+
+
+def _walk_code(code: types.CodeType) -> Iterator[types.CodeType]:
+    yield code
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            yield from _walk_code(const)
 
 
 def _is_first_party_module(module_name: str) -> bool:
