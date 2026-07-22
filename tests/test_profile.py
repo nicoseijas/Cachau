@@ -223,3 +223,23 @@ def test_profile_is_immutable():
     p = f.cache.profile(1)
     with pytest.raises(dataclasses.FrozenInstanceError):
         p.verdict = "worth_it"
+
+
+def test_profile_survives_a_backend_that_rejects_the_throwaway_write():
+    """#53: profile() measures read cost against a throwaway entry when the
+    key is absent; a backend whose set() fails (locked path, WinError 5/32)
+    must degrade the measurement, not leak out of a diagnostic call."""
+    from cachau import cache
+    from cachau.memory import MemoryBackend
+
+    class RejectingSet(MemoryBackend):
+        def set(self, key, entry):
+            raise PermissionError(5, "path open in another process")
+
+    @cache(backend=RejectingSet())
+    def compute(x):
+        return x * 2
+
+    profiled = compute.cache.profile(3, repeats=1)
+    assert profiled.compute_seconds > 0
+    assert profiled.read_seconds >= 0
