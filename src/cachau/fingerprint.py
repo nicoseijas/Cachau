@@ -391,8 +391,14 @@ def _feed_code(hasher: Any, code: types.CodeType) -> None:
     _feed_framed(hasher, b"|varnames:", ",".join(code.co_varnames).encode())
     for const in code.co_consts:
         if isinstance(const, types.CodeType):
-            hasher.update(b"|nested:")  # its components frame themselves
-            _feed_code(hasher, const)
+            # Digest the child into its own hasher and frame the fixed-length
+            # digest: emitting its components inline left the block with no
+            # terminator, so a parent's trailing constants could be read as
+            # the child's (#54) — only constructible with fabricated code
+            # objects, framed anyway for defense in depth.
+            nested = hashlib.sha256()
+            _feed_code(nested, const)
+            _feed_framed(hasher, b"|nested:", nested.digest())
         else:
             _feed_framed(hasher, b"|const:", _canonical_const(const).encode())
 
