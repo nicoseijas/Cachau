@@ -20,6 +20,9 @@ class CacheStats:
     miss_expired: int
     miss_invalidated: int
     miss_dependency_changed: int
+    # Sampled verification (verify=): the cached value did not match a fresh
+    # recompute — served as the fresh value, counted as a miss with this reason.
+    miss_verification_failed: int
     expirations: int
     writes: int
     skipped_writes: int
@@ -36,6 +39,11 @@ class CacheStats:
     code_change_invalidations: int
     entries: int
     current_bytes: int
+    # verify= sampling: how many HITs were recomputed for comparison, and how
+    # many of those comparisons failed (each failure is also a
+    # miss_verification_failed).
+    verifications: int
+    verification_failures: int
     total_compute_seconds: float
     estimated_saved_seconds: float
     # First computation of a JIT dispatcher includes one-time compilation;
