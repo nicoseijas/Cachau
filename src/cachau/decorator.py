@@ -1113,10 +1113,6 @@ def _wrap(
                 # cache to make room for a pathological entry.
                 control._bump("skipped_oversized")
                 return
-            for evicted_key in budget.admit(key, size):
-                safe_delete(evicted_key)
-                control._bump("evictions")
-                control._note_eviction(evicted_key)
         try:
             store.set(
                 key,
@@ -1131,16 +1127,29 @@ def _wrap(
                     dependency_fingerprints=dep_fingerprints,
                 ),
             )
-            control._record_commit(None if is_cold_jit else compute_elapsed)
-            control._pending_invalidations.discard(key)  # fresh value overwrote it
-            control._note_recached(key)  # no longer 'evicted' — it's cached again
         except Exception:
             # The cache is an optimization: a failed write (serialization,
-            # disk) never loses the computed result. Release the budget slot
-            # so a phantom entry cannot shrink future capacity.
+            # disk) never loses the computed result. The key was never
+            # admitted, so no slot leaks and nothing was evicted for it.
             control._bump("write_errors")
-            if budget is not None:
-                budget.forget(key)
+            return
+        if budget is not None:
+            # Admit AFTER the write lands (#52): eviction only ever targets
+            # admitted keys, so under the old admit-first order a concurrent
+            # different-key commit could evict-and-delete this key while its
+            # file did not exist yet — the set then landed it untracked, an
+            # orphan no eviction could reach, and disk grew without bound.
+            # Set-first inverts the residual race into the safe direction: an
+            # eviction may delete a freshly re-committed file, leaving a
+            # tracked-but-absent phantom that costs one later MISS and heals
+            # on the next commit of that key. Bounded, never incorrect.
+            for evicted_key in budget.admit(key, size):
+                safe_delete(evicted_key)
+                control._bump("evictions")
+                control._note_eviction(evicted_key)
+        control._record_commit(None if is_cold_jit else compute_elapsed)
+        control._pending_invalidations.discard(key)  # fresh value overwrote it
+        control._note_recached(key)  # no longer 'evicted' — it's cached again
 
     def _verify_flight(
         key: str, args: tuple, kwargs: dict, dep_fingerprints: dict[str, str] | None
