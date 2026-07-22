@@ -5,8 +5,11 @@ from __future__ import annotations
 import functools
 import os
 import pathlib
+import pickle
+import random
 import threading
 import time
+import warnings
 from collections import OrderedDict
 from typing import Any, Callable, Iterable, TypeVar, overload
 
@@ -20,7 +23,11 @@ from cachau.dependencies import (
 )
 from cachau.disk import DiskBackend
 from cachau.durations import parse_ttl
-from cachau.errors import ConfigurationError
+from cachau.errors import (
+    CacheVerificationWarning,
+    ConfigurationError,
+    UnhashableArgumentError,
+)
 from cachau.explanation import Explanation
 from cachau.fingerprint import (
     function_fingerprint,
@@ -32,7 +39,12 @@ from cachau.inspection import CacheEntryView, Inspection
 from cachau.flight import KeyedLocks
 import inspect
 
-from cachau.keys import digest_arguments, digest_custom_key, normalize_call
+from cachau.keys import (
+    _digest_value,
+    digest_arguments,
+    digest_custom_key,
+    normalize_call,
+)
 from cachau.memory import MemoryBackend
 from cachau.policy import LRUBudget
 from cachau.profile import CacheProfile, diagnose, largest_data_arg, measure
@@ -65,6 +77,7 @@ TALLY_NAMES = (
     "miss_expired",
     "miss_invalidated",
     "miss_dependency_changed",
+    "miss_verification_failed",
     "writes",
     "evictions",
     "skipped_oversized",
@@ -78,6 +91,8 @@ TALLY_NAMES = (
     "compute_count",
     "estimated_saved_seconds",
     "cold_compute_seconds",
+    "verifications",
+    "verification_failures",
 )
 
 
@@ -112,6 +127,7 @@ class CacheControl:
         self.miss_expired = 0
         self.miss_invalidated = 0
         self.miss_dependency_changed = 0
+        self.miss_verification_failed = 0
         self.writes = 0
         # Seeded: rehydrating the budget over a persistent store can already
         # have evicted, before the first call of this process.
@@ -127,6 +143,8 @@ class CacheControl:
         self.compute_count = 0
         self.estimated_saved_seconds = 0.0
         self.cold_compute_seconds = 0.0
+        self.verifications = 0
+        self.verification_failures = 0
         # Reason markers: the delete succeeded; remembering the key only
         # attributes the next miss to miss_invalidated. Bounded LRU-style.
         self._invalidation_markers: OrderedDict[str, None] = OrderedDict()
@@ -441,6 +459,7 @@ class CacheControl:
             + tally["miss_expired"]
             + tally["miss_invalidated"]
             + tally["miss_dependency_changed"]
+            + tally["miss_verification_failed"]
         )
         total_calls = tally["hits"] + misses
         return CacheStats(
@@ -452,6 +471,7 @@ class CacheControl:
             miss_expired=tally["miss_expired"],
             miss_invalidated=tally["miss_invalidated"],
             miss_dependency_changed=tally["miss_dependency_changed"],
+            miss_verification_failed=tally["miss_verification_failed"],
             expirations=tally["miss_expired"],
             writes=tally["writes"],
             skipped_writes=(
@@ -473,6 +493,8 @@ class CacheControl:
             total_compute_seconds=tally["total_compute_seconds"],
             estimated_saved_seconds=tally["estimated_saved_seconds"],
             cold_compute_seconds=tally["cold_compute_seconds"],
+            verifications=tally["verifications"],
+            verification_failures=tally["verification_failures"],
         )
 
     def _iter_metadata(self) -> Iterable[EntryMetadata]:
@@ -496,6 +518,7 @@ def cache(
     backend: CacheBackend | None = None,
     clock: Clock = ...,
     size_of: SizeOf = ...,
+    verify: int | float = 0.0,
 ) -> Callable[[F], F]: ...
 
 
@@ -512,6 +535,7 @@ def cache(
     backend: CacheBackend | None = None,
     clock: Clock = time.time,
     size_of: SizeOf = estimate_size,
+    verify: int | float = 0.0,
 ) -> Any:
     """Cache a function's results, keyed by its normalized arguments.
 
@@ -527,17 +551,46 @@ def cache(
     descriptors — that invalidate a result when they change (a ``dependency_
     changed`` miss). Exceptions are never cached; unhashable arguments fail
     loudly. ``func.cache`` exposes ``stats()``, ``clear()`` and
-    ``invalidate(...)``.
+    ``invalidate(...)``. ``verify=`` (a probability, default 0) recomputes that
+    fraction of HITs and compares against the cached value: a mismatch warns
+    (``CacheVerificationWarning``), counts as ``miss_verification_failed``, and
+    the fresh value replaces the entry — the safety net for transitive code
+    changes the fingerprint cannot see and for nondeterministic functions.
     """
     if func is not None:
         return _wrap(
             func, ttl, max_memory, persist, namespace, key, ignore, depends_on,
-            backend, clock, size_of,
+            backend, clock, size_of, verify,
         )
     return lambda f: _wrap(
         f, ttl, max_memory, persist, namespace, key, ignore, depends_on, backend,
-        clock, size_of,
+        clock, size_of, verify,
     )
+
+
+def _values_match(cached: Any, fresh: Any) -> tuple[bool, bool]:
+    """``(compared, equal)``: content comparison for ``verify=``.
+
+    Uses the same type-tagged digest that keys arguments, so ndarrays and
+    DataFrames compare by content. Values the digest cannot hash fall back to
+    pickle-bytes equality (the representation persistence already relies on);
+    a value that is neither digestible nor picklable cannot be compared and
+    returns ``(False, False)``. The pickle fallback can report a spurious
+    mismatch for equal values with unequal serializations (differently-ordered
+    dicts, say) — the consequence is conservative: a warning and a recommit of
+    the fresh value, never a false HIT.
+    """
+    try:
+        return True, _digest_value(cached) == _digest_value(fresh)
+    except UnhashableArgumentError:
+        pass
+    try:
+        return True, (
+            pickle.dumps(cached, protocol=pickle.HIGHEST_PROTOCOL)
+            == pickle.dumps(fresh, protocol=pickle.HIGHEST_PROTOCOL)
+        )
+    except Exception:  # noqa: BLE001 - any serialization failure means "unknown"
+        return False, False
 
 
 def _resolve_backend(
@@ -678,6 +731,7 @@ def _wrap(
     backend: CacheBackend | None,
     clock: Clock,
     size_of: SizeOf,
+    verify: int | float = 0.0,
 ) -> Callable[..., Any]:
     # Fail fast: bad configuration breaks at decoration time, not on first call.
     if key is not None and ignore:
@@ -685,6 +739,12 @@ def _wrap(
             "key= and ignore= are mutually exclusive: an explicit key already "
             "defines the full identity, so there is nothing left to ignore"
         )
+    if not isinstance(verify, (int, float)) or not 0.0 <= verify <= 1.0:
+        raise ConfigurationError(
+            f"verify= must be a probability between 0 and 1, got {verify!r}"
+        )
+    verify_probability = float(verify)
+    verify_rng = random.Random()
     ignored_names = _validate_ignore(func, ignore)
     dependencies = normalize_dependencies(depends_on)
     ttl_seconds = parse_ttl(ttl)
@@ -754,6 +814,27 @@ def _wrap(
 
     _NOT_SERVED = object()
 
+    def _fresh_entry(
+        key: str, dep_fingerprints: dict[str, str] | None
+    ) -> CacheEntry | None:
+        """The entry a HIT would serve, or ``None`` — no counters, no recency."""
+        if key in control._pending_invalidations:
+            return None
+        entry = store.get(key)
+        if entry is None or entry.is_expired(now()):
+            return None
+        if dependencies and entry.dependency_fingerprints != dep_fingerprints:
+            # A declared dependency changed since this entry was committed:
+            # the stored result no longer reflects the current inputs. Not a
+            # HIT; the locked flight reclassifies and recomputes it.
+            return None
+        if key in control._pending_invalidations:
+            # Re-check after the read: a concurrent invalidate whose physical
+            # delete failed may have quarantined the key while we were reading
+            # the backend. Never serve a condemned entry.
+            return None
+        return entry
+
     def serve_if_fresh(key: str, dep_fingerprints: dict[str, str] | None, *,
                        coalesced: bool) -> Any:
         """Serve a fresh entry with hit bookkeeping, or return _NOT_SERVED.
@@ -762,20 +843,8 @@ def _wrap(
         the locked flight, so the fast path and the post-lock re-check can
         share this without double counting.
         """
-        if key in control._pending_invalidations:
-            return _NOT_SERVED
-        entry = store.get(key)
-        if entry is None or entry.is_expired(now()):
-            return _NOT_SERVED
-        if dependencies and entry.dependency_fingerprints != dep_fingerprints:
-            # A declared dependency changed since this entry was committed:
-            # the stored result no longer reflects the current inputs. Not a
-            # HIT; the locked flight reclassifies and recomputes it.
-            return _NOT_SERVED
-        if key in control._pending_invalidations:
-            # Re-check after the read: a concurrent invalidate whose physical
-            # delete failed may have quarantined the key while we were reading
-            # the backend. Never serve a condemned entry.
+        entry = _fresh_entry(key, dep_fingerprints)
+        if entry is None:
             return _NOT_SERVED
         if budget is not None:
             budget.touch(key)
@@ -786,6 +855,11 @@ def _wrap(
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         key = build_key(*args, **kwargs)
         dep_fingerprints = current_dependencies()
+        if verify_probability > 0.0 and (
+            verify_probability >= 1.0 or verify_rng.random() < verify_probability
+        ):
+            with flights.holding(key):
+                return _verify_flight(key, args, kwargs, dep_fingerprints)
         served = serve_if_fresh(key, dep_fingerprints, coalesced=False)
         if served is not _NOT_SERVED:
             return served
@@ -835,6 +909,12 @@ def _wrap(
                     control._bump("miss_invalidated")
                 else:
                     control._bump("miss_not_found")
+        value, compute_elapsed, is_cold_jit = _run_and_time(args, kwargs)
+        _commit_result(key, value, dep_fingerprints, compute_elapsed, is_cold_jit)
+        return value
+
+    def _run_and_time(args: tuple, kwargs: dict) -> tuple[Any, float, bool]:
+        """Execute the function once with compute and cold-JIT accounting."""
         specializations_before = -1
         if jit_boundary:
             known_signatures = getattr(func, "signatures", None)
@@ -858,6 +938,16 @@ def _wrap(
                 is_cold_jit = control.compute_count == 1
             if is_cold_jit:
                 control._bump("cold_compute_seconds", compute_elapsed)
+        return value, compute_elapsed, is_cold_jit
+
+    def _commit_result(
+        key: str,
+        value: Any,
+        dep_fingerprints: dict[str, str] | None,
+        compute_elapsed: float,
+        is_cold_jit: bool,
+    ) -> None:
+        """Store a computed result, or skip caching when it cannot be trusted."""
         if dependencies:
             # A declared dependency may have moved WHILE func() ran. Re-observe
             # after compute and refuse to cache if it changed: stamping the
@@ -872,7 +962,7 @@ def _wrap(
             dep_after = current_dependencies()
             if dep_after != dep_fingerprints:
                 control._bump("dependency_race_skips")
-                return value
+                return
             dep_fingerprints = dep_after
         committed_at = now()  # TTL starts at commit, not at call start
         size: int | None = None
@@ -884,15 +974,15 @@ def _wrap(
                 size = int(size_of(value))
             except Exception:
                 control._bump("size_estimate_failures")
-                return value
+                return
             if size < 0:
                 control._bump("size_estimate_failures")
-                return value
+                return
             if not budget.fits(size):
                 # Oversized: compute, return, never cache, never flush the
                 # cache to make room for a pathological entry.
                 control._bump("skipped_oversized")
-                return value
+                return
             for evicted_key in budget.admit(key, size):
                 safe_delete(evicted_key)
                 control._bump("evictions")
@@ -921,6 +1011,57 @@ def _wrap(
             control._bump("write_errors")
             if budget is not None:
                 budget.forget(key)
+
+    def _verify_flight(
+        key: str, args: tuple, kwargs: dict, dep_fingerprints: dict[str, str] | None
+    ) -> Any:
+        """A call selected by ``verify=``: recompute even on a HIT and compare.
+
+        Runs under the per-key lock so the comparison and any replacement are
+        atomic with respect to concurrent flights of the same key. With no
+        fresh entry there is nothing to verify — it is a normal miss.
+        """
+        entry = _fresh_entry(key, dep_fingerprints)
+        if entry is None:
+            return _compute_flight(key, args, kwargs, dep_fingerprints)
+        cached = entry.value
+        value, compute_elapsed, is_cold_jit = _run_and_time(args, kwargs)
+        compared, matches = _values_match(cached, value)
+        if not compared:
+            # Neither digestible nor picklable: no comparison happened, so no
+            # verdict is recorded. Serve it as the HIT it would have been —
+            # but without time-saved credit, since the recompute actually ran.
+            with control._counter_guard:
+                control.hits += 1
+            if budget is not None:
+                budget.touch(key)
+            return cached
+        if matches:
+            # A verified HIT. Counted as a hit but with no time-saved credit:
+            # the recompute actually ran — that cost is the price of the check.
+            with control._counter_guard:
+                control.hits += 1
+                control.verifications += 1
+            if budget is not None:
+                budget.touch(key)
+            return cached
+        with control._counter_guard:
+            control.verifications += 1
+            control.verification_failures += 1
+            control.miss_verification_failed += 1
+        warnings.warn(
+            f"cachau: cached value for {resolved_namespace} does not match a "
+            f"fresh recompute; the fresh value replaced it. Either something "
+            f"the fingerprint cannot see changed (an unfingerprinted helper, "
+            f"an undeclared external input) or the function is "
+            f"nondeterministic.",
+            CacheVerificationWarning,
+            stacklevel=3,
+        )
+        safe_delete(key)
+        if budget is not None:
+            budget.forget(key)
+        _commit_result(key, value, dep_fingerprints, compute_elapsed, is_cold_jit)
         return value
 
     control = CacheControl(

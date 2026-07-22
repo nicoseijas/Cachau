@@ -8,6 +8,7 @@ from cachau.profile import CacheProfile
 from cachau.stats import CacheStats
 from cachau.errors import (
     CachauError,
+    CacheVerificationWarning,
     ConfigurationError,
     InvalidSizeError,
     InvalidTTLError,
@@ -27,6 +28,7 @@ __all__ = [
     "CacheEntryView",
     "Inspection",
     "CachauError",
+    "CacheVerificationWarning",
     "Explanation",
     "ConfigurationError",
     "InvalidSizeError",

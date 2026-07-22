@@ -23,3 +23,13 @@ class UnhashableArgumentError(CachauError, TypeError):
     Raised loudly instead of silently ignoring the argument: an ignored argument
     would make semantically different calls share a cache entry (a false HIT).
     """
+
+
+class CacheVerificationWarning(UserWarning):
+    """A verified HIT did not match a fresh recompute; the fresh value won.
+
+    Emitted by ``verify=``: either something the fingerprint cannot see changed
+    (a module-level helper, an undeclared external input) or the function is
+    nondeterministic. The cache never serves the mismatched value — it is
+    replaced and the call returns the fresh result.
+    """
