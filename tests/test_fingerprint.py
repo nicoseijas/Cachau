@@ -343,3 +343,26 @@ def price(x):
     exec(cell.format(a=12, b=3), scope)
     assert scope["price"](10) == 123  # recomputed, not the stale 33
     assert scope["price"].cache.stats().code_change_invalidations == 1
+
+
+def test_nested_code_block_boundary_cannot_be_reframed():
+    """#54: the nested-code block was emitted unframed, so a parent whose
+    trailing constants continue where the nested block ends could collide
+    with a parent whose nested child absorbed those constants. Only
+    reachable with fabricated code objects — defense in depth."""
+    import types
+
+    def template():
+        pass
+
+    inner = (lambda: None).__code__
+    inner_absorbing = inner.replace(co_consts=inner.co_consts + ("x",))
+    parent_a = template.__code__.replace(co_consts=(inner, "x"))
+    parent_b = template.__code__.replace(co_consts=(inner_absorbing,))
+    func_a = types.FunctionType(parent_a, {})
+    func_b = types.FunctionType(parent_b, {})
+
+    assert function_fingerprint(func_a) != function_fingerprint(func_b)
+    assert function_fingerprint(func_a) == function_fingerprint(
+        types.FunctionType(template.__code__.replace(co_consts=(inner, "x")), {})
+    )
