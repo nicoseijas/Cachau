@@ -128,6 +128,47 @@ def _feed_data_object(hasher: Any, value: Any) -> bool:
         if isinstance(value, np.generic):
             _feed(hasher, value.item())  # semantic value: np.int64(7) == 7
             return True
+    pl = sys.modules.get("polars")
+    if pl is not None:
+        if isinstance(value, pl.DataFrame):
+            # Row hashes cover VALUES only (renaming a column does not change
+            # them), so the schema — names, dtypes, order — is emitted
+            # separately. Row count disambiguates empty frames; row order is
+            # preserved by feeding the hash sequence in order. Like pandas'
+            # hasher above, polars does not promise hash stability across ITS
+            # versions: an upgrade can re-miss persisted entries — a
+            # conservative recompute, never a false HIT.
+            _emit(
+                hasher,
+                b"pl-frame-schema",
+                repr([(name, str(dtype)) for name, dtype in value.schema.items()]).encode(),
+            )
+            _emit_count(hasher, b"pl-frame-rows", value.height)
+            try:
+                row_hashes = value.hash_rows(seed=0)
+            except Exception as exc:  # noqa: BLE001 - exotic dtype: fail loudly
+                raise UnhashableArgumentError(
+                    f"polars DataFrame could not be hashed: {exc}"
+                ) from None
+            _emit(hasher, b"pl-frame-data", _polars_hash_bytes(row_hashes))
+            return True
+        if isinstance(value, pl.Series):
+            _emit(hasher, b"pl-series-name", value.name.encode())
+            _emit(hasher, b"pl-series-dtype", str(value.dtype).encode())
+            _emit_count(hasher, b"pl-series-rows", len(value))
+            try:
+                item_hashes = value.hash(seed=0)
+            except Exception as exc:  # noqa: BLE001 - exotic dtype: fail loudly
+                raise UnhashableArgumentError(
+                    f"polars Series could not be hashed: {exc}"
+                ) from None
+            _emit(hasher, b"pl-series-data", _polars_hash_bytes(item_hashes))
+            return True
+        if isinstance(value, pl.LazyFrame):
+            raise UnhashableArgumentError(
+                "a LazyFrame is a query plan, not data — collect() it before "
+                "caching, or key on something that identifies the plan"
+            )
     pd = sys.modules.get("pandas")
     if pd is not None:
         if isinstance(value, pd.DataFrame):
@@ -152,6 +193,22 @@ def _feed_data_object(hasher: Any, value: Any) -> bool:
             _emit(hasher, b"index-data", row_hashes.to_numpy().tobytes())
             return True
     return False
+
+
+def _polars_hash_bytes(hashes: Any) -> bytes:
+    """A UInt64 hash Series as order-preserving bytes.
+
+    NumPy gives the zero-copy fast path; without it, fall back to a Python
+    loop — slower on big frames but dependency-free, matching cachau's rule
+    that no library is ever required or imported by cachau itself. The
+    fallback matches the numpy path's byte order (little-endian on every
+    common platform), so whether numpy happens to be imported cannot fork
+    the digest of the same frame.
+    """
+    np = sys.modules.get("numpy")
+    if np is not None:
+        return hashes.to_numpy().tobytes()
+    return b"".join(item.to_bytes(8, "little") for item in hashes.to_list())
 
 
 def _feed(hasher: Any, value: Any) -> None:

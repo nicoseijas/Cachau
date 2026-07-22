@@ -16,7 +16,7 @@ def expensive_analysis(df, config):
     ...
 ```
 
-> **Status: v0.5.0 — the core engine plus validated Numba Level A support** (395 tests, CI on 3.10-3.13 plus free-threaded 3.13t/3.14t): normalized keys with type-tagged hashing (incl. closure captures), native NumPy/pandas identity, `key=`/`ignore=` escape hatches (incl. `array_token()` for big immutable args), code-change invalidation, TTL, LRU memory bounds that survive restarts, atomic corruption-safe persistence, same-key single-flight, `stats()` with miss reasons and cold/warm JIT accounting, `explain()` (with eviction, dependency-diff, and write-failure detail), `inspect()`, `depends_on=` external-dependency invalidation (files, env vars, package versions, custom tokens, helper implementations via `code()`), `verify=` sampled hit verification, `profile()` (measured cache economics), and `cachau.testing` certification assertions. Pre-1.0, so the API may still evolve. Next up: Polars hashing (see [ROADMAP](ROADMAP.md)).
+> **Status: v0.5.0 — the core engine plus validated Numba Level A support** (395 tests, CI on 3.10-3.13 plus free-threaded 3.13t/3.14t): normalized keys with type-tagged hashing (incl. closure captures), native NumPy/pandas/Polars identity, `key=`/`ignore=` escape hatches (incl. `array_token()` for big immutable args), code-change invalidation, TTL, LRU memory bounds that survive restarts, atomic corruption-safe persistence, same-key single-flight, `stats()` with miss reasons and cold/warm JIT accounting, `explain()` (with eviction, dependency-diff, and write-failure detail), `inspect()`, `depends_on=` external-dependency invalidation (files, env vars, package versions, custom tokens, helper implementations via `code()`), `verify=` sampled hit verification, `profile()` (measured cache economics), and `cachau.testing` certification assertions. Pre-1.0, so the API may still evolve. Next up: notebook polish (see [ROADMAP](ROADMAP.md)).
 >
 > **Upgrading from 0.2.x:** v0.3.x fixes a fingerprint collision that could serve one function's result for another (a false HIT). Closing it changes how every function's identity is computed, so **existing persisted caches are invalidated once** — the first run after upgrading recomputes and reclaims the old files automatically. No action needed.
 
@@ -26,7 +26,7 @@ def expensive_analysis(df, config):
 pip install cachau
 ```
 
-Python 3.10+. **Zero dependencies** — NumPy, pandas, and Numba integrations activate automatically when those libraries are present, without ever importing them.
+Python 3.10+. **Zero dependencies** — NumPy, pandas, Polars, and Numba integrations activate automatically when those libraries are present, without ever importing them.
 
 ## Quick start
 
@@ -57,7 +57,7 @@ Plenty of libraries offer TTL, persistence, or LRU. None of them combine what da
 
 | Problem | Cachau's answer |
 |---|---|
-| Hashing a 2 GB DataFrame just to build a key | Native hashing for NumPy and pandas (dtype + shape + content; layout-canonicalized) — plus explicit `key=` / `ignore=` escape hatches |
+| Hashing a 2 GB DataFrame just to build a key | Native hashing for NumPy, pandas, and Polars (dtype + schema + content; layout-canonicalized) — plus explicit `key=` / `ignore=` escape hatches |
 | Stale results after you edit the function | Code-fingerprint invalidation by default: change `x * 2` to `x * 3` — or a closure capture, or a Numba compile flag — and the old result dies |
 | N threads recomputing the same missing key | Same-key single-flight: one computation, everyone else reuses it; independent keys never serialize |
 | Caches that eat all your RAM or disk | First-class `max_memory` bounds with predictable LRU eviction; oversized results are returned but never cached |
@@ -242,6 +242,8 @@ Persisted values are serialized with `pickle`, so **reading** an entry deseriali
 - Never ship or download a prepopulated cache directory as if it were data.
 
 Cachau treats damaged entries as a MISS (bad version, corrupt metadata, undecodable payload — the file is dropped and the value recomputed), but that is corruption handling, not a defense against a hostile writer.
+
+One honesty note on persisted keys: pandas and Polars data identity uses those libraries' own hashers, which do not promise stability across *their* versions — upgrading pandas or polars can re-miss previously persisted entries. That is a conservative recompute, never a false HIT.
 
 **Multiple processes sharing one cache directory** is always safe for correctness: writes are atomic (per-writer temp file, `os.replace`, directory fsync), so concurrent workers can never corrupt the store or read a torn entry. By default they are not deduplicated — N workers missing the same expensive key all compute it and the last write wins. `coalesce="processes"` opts into cross-process single-flight via advisory lock files: workers missing one key elect a single computer (`O_CREAT|O_EXCL`, atomic on POSIX and Windows) and the rest poll for its commit. The elected holder **heartbeats** its lock, so "stale" means the holder stopped beating (it crashed — recovered within a few seconds), never that the compute is slow: a healthy holder is never preempted no matter how long it runs, while a wedged-but-alive one keeps beating and waiters simply run out their own bounded deadline — derived from the function's observed compute time — and compute anyway. Every degradation is "compute redundantly", exactly the uncoordinated behavior; nothing can hang. `stats()` reports `process_coalesced_hits`, `process_flight_timeouts`, and `stale_locks_broken`. Validated in-repo with a real multi-process cold-burst test; large-scale contention validation is tracked in [#35](https://github.com/nicoseijas/Cachau/issues/35).
 
