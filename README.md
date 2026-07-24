@@ -1,6 +1,6 @@
 # Cachau
 
-[![PyPI](https://img.shields.io/pypi/v/cachau)](https://pypi.org/project/cachau/) [![Python](https://img.shields.io/pypi/pyversions/cachau)](https://pypi.org/project/cachau/) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/cachau)](https://pypi.org/project/cachau/) [![Python](https://img.shields.io/pypi/pyversions/cachau)](https://pypi.org/project/cachau/) [![Downloads](https://img.shields.io/pypi/dm/cachau)](https://pypistats.org/packages/cachau) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 **Delightful, observable, bounded, and persistent function caching for Python data workloads.**
 
