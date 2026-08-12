@@ -1,0 +1,37 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    name: build and publish to PyPI
+    runs-on: ubuntu-latest
+    environment: cachica
+    permissions:
+      # Mints the OIDC token PyPI's trusted publisher exchanges for an upload
+      # grant. No API token is stored anywhere.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build
+        run: |
+          pip install build twine
+          python -m build
+          python -m twine check dist/*
+      - name: Tag matches the packaged version
+        # Releases are cut by hand, and the tag has drifted from the packaged
+        # version before. Catch it here rather than on PyPI, where a wrong
+        # version can never be re-uploaded.
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          built=$(ls dist/*.tar.gz | sed -E 's/.*cachau-(.*)\.tar\.gz/\1/')
+          test "$tag" = "$built" || {
+            echo "tag $GITHUB_REF_NAME does not match packaged version $built"
+            exit 1
+          }
+      - uses: pypa/gh-action-pypi-publish@release/v1
