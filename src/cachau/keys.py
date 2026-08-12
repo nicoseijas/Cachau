@@ -5,6 +5,10 @@ A cache key must represent normalized arguments: semantically equivalent calls
 merely compare equal across types (``1 == 1.0 == True``) never collide — every
 value is hashed with an explicit type tag.
 
+Subclasses would inherit their branch's tag, so ``_emit_concrete_type`` adds the
+concrete type wherever that would collide. Path flavors are the deliberate
+exception: ``Path`` and ``PurePath`` denote the same location and stay one key.
+
 Encoding scheme (collision safety): the byte stream fed to the hasher must be
 unambiguously decodable, or two different values could concatenate to the same
 bytes (delimiter injection). Every emission is ``tag + NUL + 8-byte big-endian
@@ -100,6 +104,20 @@ def _type_identity(value: Any) -> bytes:
     return f"{cls.__module__}.{cls.__qualname__}".encode()
 
 
+def _emit_concrete_type(hasher: Any, value: Any, base: type) -> None:
+    """Tag a value whose concrete type is not the one its branch matched.
+
+    Branches dispatch on ``isinstance``, so without this tag a ``bytearray``
+    digests as ``bytes`` and a ``NamedTuple`` as a plain tuple — a false HIT
+    whenever the result depends on the argument's type.
+
+    Exact builtins emit nothing, which keeps every already-persisted entry
+    readable: only the values that were colliding get a new key.
+    """
+    if type(value) is not base:
+        _emit(hasher, b"subtype", _type_identity(value))
+
+
 def _feed_data_object(hasher: Any, value: Any) -> bool:
     """Native hashing for NumPy/pandas objects; True when handled.
 
@@ -111,6 +129,7 @@ def _feed_data_object(hasher: Any, value: Any) -> bool:
     np = sys.modules.get("numpy")
     if np is not None:
         if isinstance(value, np.ndarray):
+            _emit_concrete_type(hasher, value, np.ndarray)
             _emit(hasher, b"ndarray-shape", repr(value.shape).encode())
             if value.dtype == object:
                 # Object arrays hold arbitrary Python values: hash elementwise
@@ -131,6 +150,7 @@ def _feed_data_object(hasher: Any, value: Any) -> bool:
     pl = sys.modules.get("polars")
     if pl is not None:
         if isinstance(value, pl.DataFrame):
+            _emit_concrete_type(hasher, value, pl.DataFrame)
             # Row hashes cover VALUES only (renaming a column does not change
             # them), so the schema — names, dtypes, order — is emitted
             # separately. Row count disambiguates empty frames; row order is
@@ -153,6 +173,7 @@ def _feed_data_object(hasher: Any, value: Any) -> bool:
             _emit(hasher, b"pl-frame-data", _polars_hash_bytes(row_hashes))
             return True
         if isinstance(value, pl.Series):
+            _emit_concrete_type(hasher, value, pl.Series)
             _emit(hasher, b"pl-series-name", value.name.encode())
             _emit(hasher, b"pl-series-dtype", str(value.dtype).encode())
             _emit_count(hasher, b"pl-series-rows", len(value))
@@ -172,6 +193,7 @@ def _feed_data_object(hasher: Any, value: Any) -> bool:
     pd = sys.modules.get("pandas")
     if pd is not None:
         if isinstance(value, pd.DataFrame):
+            _emit_concrete_type(hasher, value, pd.DataFrame)
             _emit(hasher, b"dataframe-columns", repr(list(value.columns)).encode())
             _emit(
                 hasher,
@@ -182,12 +204,14 @@ def _feed_data_object(hasher: Any, value: Any) -> bool:
             _emit(hasher, b"dataframe-data", row_hashes.to_numpy().tobytes())
             return True
         if isinstance(value, pd.Series):
+            _emit_concrete_type(hasher, value, pd.Series)
             _emit(hasher, b"series-name", repr(value.name).encode())
             _emit(hasher, b"series-dtype", str(value.dtype).encode())
             row_hashes = pd.util.hash_pandas_object(value, index=True)
             _emit(hasher, b"series-data", row_hashes.to_numpy().tobytes())
             return True
         if isinstance(value, pd.Index):
+            _emit_concrete_type(hasher, value, pd.Index)
             _emit(hasher, b"index-dtype", str(value.dtype).encode())
             row_hashes = pd.util.hash_pandas_object(value)
             _emit(hasher, b"index-data", row_hashes.to_numpy().tobytes())
@@ -221,14 +245,19 @@ def _feed(hasher: Any, value: Any) -> None:
     elif isinstance(value, bool):
         _emit(hasher, b"bool", b"\x01" if value else b"\x00")
     elif isinstance(value, int):
+        _emit_concrete_type(hasher, value, int)
         _emit(hasher, b"int", str(value).encode())
     elif isinstance(value, float):
+        _emit_concrete_type(hasher, value, float)
         _emit(hasher, b"float", repr(value).encode())
     elif isinstance(value, complex):
+        _emit_concrete_type(hasher, value, complex)
         _emit(hasher, b"complex", repr(value).encode())
     elif isinstance(value, str):
+        _emit_concrete_type(hasher, value, str)
         _emit(hasher, b"str", value.encode())
     elif isinstance(value, (bytes, bytearray)):
+        _emit_concrete_type(hasher, value, bytes)
         _emit(hasher, b"bytes", bytes(value))
     elif isinstance(value, pathlib.PureWindowsPath):
         _emit(hasher, b"path-win", str(value).encode())
@@ -242,14 +271,17 @@ def _feed(hasher: Any, value: Any) -> None:
             _emit(hasher, b"field", field.name.encode())
             _feed(hasher, getattr(value, field.name))
     elif isinstance(value, tuple):
+        _emit_concrete_type(hasher, value, tuple)
         _emit_count(hasher, b"tuple", len(value))
         for item in value:
             _feed(hasher, item)
     elif isinstance(value, list):
+        _emit_concrete_type(hasher, value, list)
         _emit_count(hasher, b"list", len(value))
         for item in value:
             _feed(hasher, item)
     elif isinstance(value, dict):
+        _emit_concrete_type(hasher, value, dict)
         _emit_count(hasher, b"dict", len(value))
         # Fold each pair to fixed-length digests, sorted by key digest, so
         # insertion order is irrelevant and key/value boundaries are exact.
@@ -260,10 +292,12 @@ def _feed(hasher: Any, value: Any) -> None:
             hasher.update(key_digest)
             hasher.update(item_digest)
     elif isinstance(value, frozenset):
+        _emit_concrete_type(hasher, value, frozenset)
         _emit_count(hasher, b"frozenset", len(value))
         for member_digest in sorted(_digest_value(member) for member in value):
             hasher.update(member_digest)
     elif isinstance(value, set):
+        _emit_concrete_type(hasher, value, set)
         _emit_count(hasher, b"set", len(value))
         for member_digest in sorted(_digest_value(member) for member in value):
             hasher.update(member_digest)

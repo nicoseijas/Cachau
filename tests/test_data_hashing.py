@@ -112,6 +112,25 @@ def test_end_to_end_caching_with_dataframe_arguments():
     assert calls == [3, 1]
 
 
+def test_ndarray_subclasses_do_not_collide_with_a_plain_array():
+    """A subclass can redefine operators (np.matrix does), so it is not the same
+    value even with an identical buffer."""
+
+    class Labeled(np.ndarray):
+        pass
+
+    data = np.arange(4).reshape(2, 2)
+    assert digest(data.view(Labeled)) != digest(data)
+
+
+def test_dataframe_subclasses_do_not_collide_with_a_plain_frame():
+    class Annotated(pd.DataFrame):
+        pass
+
+    frame = pd.DataFrame({"a": [1, 2]})
+    assert digest(Annotated(frame)) != digest(frame)
+
+
 def test_object_dtype_dataframe_content_is_hashed():
     left = pd.DataFrame({"s": ["abc", "def"]})
     right = pd.DataFrame({"s": ["abc", "xyz"]})
