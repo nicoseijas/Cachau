@@ -184,3 +184,29 @@ def test_code_change_invalidates(tmp_path):
     v1 = load("def compute(x):\n    return x * 2\n", "v1")
     v2 = load("def compute(x):\n    return x * 3\n", "v2")
     assert function_fingerprint(v1) != function_fingerprint(v2)
+
+
+def test_argument_type_is_part_of_the_identity():
+    """Equal contents of different types must not share an entry.
+
+    ``bytearray`` shares a hashing branch with ``bytes`` and a ``NamedTuple``
+    shares one with ``tuple``, so a collision here is a silent false HIT.
+    """
+    from typing import NamedTuple
+
+    class Point(NamedTuple):
+        x: int
+        y: int
+
+    seen = []
+
+    @cache
+    def kind(value):
+        seen.append(type(value).__name__)
+        return type(value).__name__
+
+    assert kind(b"ab") == "bytes"
+    assert kind(bytearray(b"ab")) == "bytearray"
+    assert kind(Point(1, 2)) == "Point"
+    assert kind((1, 2)) == "tuple"
+    assert seen == ["bytes", "bytearray", "Point", "tuple"]

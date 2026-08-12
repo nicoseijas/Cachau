@@ -2,6 +2,7 @@
 
 import dataclasses
 import pathlib
+from typing import NamedTuple
 
 import pytest
 
@@ -115,6 +116,70 @@ def test_enum_members_do_not_collide_with_their_values():
 def test_path_flavors_differ():
     assert digest_arguments(sample, (pathlib.PurePosixPath("a/b"),), {}) != (
         digest_arguments(sample, (pathlib.PureWindowsPath("a/b"),), {})
+    )
+
+
+def test_bytes_and_bytearray_do_not_collide():
+    assert digest_arguments(sample, (b"ab",), {}) != digest_arguments(
+        sample, (bytearray(b"ab"),), {}
+    )
+
+
+def test_namedtuple_does_not_collide_with_a_plain_tuple():
+    """A NamedTuple IS a tuple; sharing its digest is a false-HIT class."""
+
+    class Point(NamedTuple):
+        x: int
+        y: int
+
+    assert digest_arguments(sample, (Point(1, 2),), {}) != digest_arguments(
+        sample, ((1, 2),), {}
+    )
+
+
+def test_distinct_namedtuples_with_equal_fields_differ():
+    class Point(NamedTuple):
+        x: int
+        y: int
+
+    class Size(NamedTuple):
+        w: int
+        h: int
+
+    assert digest_arguments(sample, (Point(1, 2),), {}) != digest_arguments(
+        sample, (Size(1, 2),), {}
+    )
+
+
+@pytest.mark.parametrize(
+    "base, argument",
+    [
+        (str, "a"),
+        (int, 7),
+        (float, 1.5),
+        (list, [1]),
+        (dict, {"k": 1}),
+        (set, {1}),
+        (frozenset, frozenset({1})),
+        (tuple, (1,)),
+    ],
+)
+def test_builtin_subclasses_do_not_collide_with_their_base(base, argument):
+    subclass = type("Derived", (base,), {})
+    assert digest_arguments(sample, (subclass(argument),), {}) != digest_arguments(
+        sample, (argument,), {}
+    )
+
+
+def test_exact_builtins_keep_their_digest():
+    """Tagging ordinary values too would silently orphan every persisted entry.
+
+    The digest is pinned rather than self-compared: recomputing both sides with
+    the same code proves nothing about compatibility across versions.
+    """
+    assert (
+        digest_arguments(sample, (1, 2), {"c": 3})
+        == "ba5118177ea7ad46dccd5f74d3e9ae606b14755ca61122f17c59f223ff43c601"
     )
 
 
