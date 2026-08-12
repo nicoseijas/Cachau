@@ -7,6 +7,7 @@ safe), never to a deadlock or a wrong value.
 """
 
 import os
+import pathlib
 import subprocess
 import sys
 import threading
@@ -17,7 +18,7 @@ import pytest
 from cachau import cache
 from cachau.backend import CacheEntry
 from cachau.errors import ConfigurationError
-from cachau.interprocess import ProcessLock
+from cachau.interprocess import MISSING, ProcessLock, coordinate
 
 
 # --------------------------------------------------------------------------- #
@@ -319,3 +320,92 @@ def test_break_stale_removes_a_lock_that_is_still_stale(tmp_path):
 def test_break_stale_handles_a_lock_that_vanished(tmp_path):
     lock = ProcessLock(tmp_path / "gone.lock")
     assert lock.break_stale(stale_after=5.0) is False
+
+
+# --------------------------------------------------------------------------- #
+# A stale lock that cannot be removed must not defeat the bounded wait
+# --------------------------------------------------------------------------- #
+
+
+class _UnbreakableStaleLock:
+    """A stale lock whose removal always fails, as a read-only lock file or an
+    unwritable cache directory makes it."""
+
+    def try_acquire(self):
+        return False
+
+    def age_seconds(self):
+        return 10_000.0  # long past any stale threshold, and it never drops
+
+    def break_stale(self, stale_after):
+        return False  # the unlink raised: the lock is still there
+
+
+def test_coordinate_is_bounded_when_a_stale_lock_cannot_be_broken():
+    """A break that keeps failing must still reach the deadline, or the loop
+    never sleeps and the caller hangs."""
+    now = [0.0]
+    probes = [0]
+
+    def monotonic():
+        return now[0]
+
+    def sleep(seconds):
+        # The only thing that advances the clock, so a loop that stops sleeping
+        # can never reach the deadline and trips the probe budget below.
+        now[0] += seconds
+
+    def probe():
+        probes[0] += 1
+        assert probes[0] < 10_000, "coordinate() spun without reaching its deadline"
+        return MISSING
+
+    outcome = coordinate(
+        _UnbreakableStaleLock(),
+        probe,
+        max_wait=1.0,
+        stale_after=5.0,
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+    assert outcome == ("timeout", None, 0)
+
+
+def test_undeletable_stale_lock_degrades_to_computing(tmp_path, monkeypatch):
+    """End to end: the caller returns on its own deadline and computes."""
+    monkeypatch.setattr("cachau.decorator._PROCESS_WAIT_DEFAULT", 0.2)
+    real_unlink = pathlib.Path.unlink
+
+    def refuse_lock_deletes(self, *args, **kwargs):
+        if self.suffix == ".lock":
+            raise PermissionError(13, "lock file cannot be removed")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", refuse_lock_deletes)
+    calls = []
+
+    @cache(persist=str(tmp_path), coalesce="processes")
+    def f(x):
+        calls.append(x)
+        return x * 2
+
+    control = f.cache
+    lock_path = control._backend.lock_path(control._key_builder(1))
+    lock_path.write_text("crashed holder whose lock is stuck")
+    long_dead = time.time() - 10_000
+    os.utime(lock_path, (long_dead, long_dead))
+
+    # Off-thread and daemon: a regression here hangs forever, and that must
+    # fail the suite rather than wedge the interpreter at exit.
+    result = {}
+    caller = threading.Thread(
+        target=lambda: result.setdefault("value", f(1)), daemon=True
+    )
+    caller.start()
+    caller.join(30.0)
+    assert not caller.is_alive(), "the caller hung on a lock it could not break"
+    assert result["value"] == 2
+    assert calls == [1]
+    stats = control.stats()
+    assert stats.process_flight_timeouts == 1
+    assert stats.stale_locks_broken == 0  # nothing was actually broken

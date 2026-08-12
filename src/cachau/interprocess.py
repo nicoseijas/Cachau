@@ -18,6 +18,10 @@ atomic entry writes keep the store safe):
   exactly one new winner;
 - a foreign process deletes our held lock mid-compute → at most one extra
   computer, no worse than before this module existed;
+- a stale lock cannot be removed at all (read-only lock file, a directory this
+  process cannot write, a foreign handle holding it open on Windows) → waiters
+  run out their own deadline and compute, so an unarbitrable lock costs the
+  bounded wait, never the caller;
 - clock skew between machines misjudges staleness → an early break (duplicate
   compute) or a longer-but-bounded wait, never corruption.
 
@@ -193,10 +197,13 @@ def coordinate(
         if lock.try_acquire():
             return "acquired", None, stale_broken
         age = lock.age_seconds()
-        if age is not None and age > stale_after:
-            if lock.break_stale(stale_after):
-                stale_broken += 1
-            continue  # retry the acquire immediately; O_EXCL picks one winner
+        if age is not None and age > stale_after and lock.break_stale(stale_after):
+            # Only a real break earns the immediate retry. A failed break does
+            # not heal by retrying — an unlink that keeps raising leaves the age
+            # permanently past the threshold — so it must reach the deadline
+            # below instead of spinning here.
+            stale_broken += 1
+            continue
         if monotonic() >= deadline:
             return "timeout", None, stale_broken
         sleep(interval)
