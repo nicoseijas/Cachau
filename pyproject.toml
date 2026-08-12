@@ -1,10 +1,13 @@
 [build-system]
-requires = ["hatchling"]
+# Pinned: newer hatchlings stamp Metadata-Version 2.5, which PyPI still rejects
+# (pypi/warehouse#19083). The emitted fields are identical to 2.4 — only the
+# version line differs. Unpin once warehouse accepts 2.5.
+requires = ["hatchling==1.31.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "cachau"
-version = "0.6.1"
+version = "0.7.0"
 description = "Delightful, observable, bounded, and persistent function caching for Python data workloads."
 readme = "README.md"
 requires-python = ">=3.10"
