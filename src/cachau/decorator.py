@@ -117,6 +117,7 @@ TALLY_NAMES = (
     "verification_failures",
     "process_coalesced_hits",
     "process_flight_timeouts",
+    "process_lock_errors",
     "stale_locks_broken",
 )
 
@@ -172,6 +173,7 @@ class CacheControl:
         self.verification_failures = 0
         self.process_coalesced_hits = 0
         self.process_flight_timeouts = 0
+        self.process_lock_errors = 0
         self.stale_locks_broken = 0
         # Reason markers: the delete succeeded; remembering the key only
         # attributes the next miss to miss_invalidated. Bounded LRU-style.
@@ -552,6 +554,7 @@ class CacheControl:
             verification_failures=tally["verification_failures"],
             process_coalesced_hits=tally["process_coalesced_hits"],
             process_flight_timeouts=tally["process_flight_timeouts"],
+            process_lock_errors=tally["process_lock_errors"],
             stale_locks_broken=tally["stale_locks_broken"],
         )
 
@@ -1029,6 +1032,8 @@ def _wrap(
             return coalesced_value
         if outcome == "timeout":
             control._bump("process_flight_timeouts")
+        elif outcome == "unavailable":
+            control._bump("process_lock_errors")
         held = lock if outcome == "acquired" else None
         try:
             # A commit may have landed between the flight's last poll and
