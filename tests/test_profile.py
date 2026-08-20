@@ -243,3 +243,25 @@ def test_profile_survives_a_backend_that_rejects_the_throwaway_write():
     profiled = compute.cache.profile(3, repeats=1)
     assert profiled.compute_seconds > 0
     assert profiled.read_seconds >= 0
+
+
+def test_profile_throwaway_survivor_is_a_correct_entry():
+    """#71: profile() removes its throwaway entry in a best-effort finally; if
+    that delete fails (Windows: file open in a concurrent reader), the survivor
+    must be a normal entry — stamped with the function's TTL and a size the
+    budget can rehydrate — not one that never expires outside max_memory."""
+
+    class UndeletableEntries(MemoryBackend):
+        def delete(self, key):
+            raise PermissionError(5, "file open in another process")
+
+    backend = UndeletableEntries()
+
+    @cache(backend=backend, ttl="1h")
+    def f(n):
+        return n
+
+    f.cache.profile(1, repeats=1)
+    ((_, entry),) = backend.iter_entries()
+    assert entry.expires_at == pytest.approx(entry.created_at + 3600)
+    assert entry.size is not None and entry.size > 0
