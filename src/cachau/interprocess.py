@@ -22,6 +22,10 @@ atomic entry writes keep the store safe):
   process cannot write, a foreign handle holding it open on Windows) → waiters
   run out their own deadline and compute, so an unarbitrable lock costs the
   bounded wait, never the caller;
+- the lock directory is unusable outright (full disk, read-only mount,
+  permissions changed after startup) → no lock exists and none can be created,
+  so there is no holder to wait on: callers skip the wait and compute at once
+  — a broken substrate costs coordination, never a stall (#67);
 - clock skew between machines misjudges staleness → an early break (duplicate
   compute) or a longer-but-bounded wait, never corruption.
 
@@ -79,19 +83,36 @@ class ProcessLock:
         self._heartbeat_stop: threading.Event | None = None
         self._heartbeat_thread: threading.Thread | None = None
 
-    def try_acquire(self) -> bool:
+    def try_acquire(self) -> bool | None:
+        """True: acquired. False: another process holds it — wait, it may
+        commit. None: no lock can be created here at all (unwritable or
+        missing directory, full disk) — no holder exists and no commit can
+        be waited on, a distinction ``coordinate()`` needs to avoid turning
+        a broken lock substrate into a full ``max_wait`` stall (#67). Never
+        raises: degrading to uncoordinated compute always beats failing the
+        call over a diagnostic file.
+        """
         try:
             descriptor = os.open(self._path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             return False
         except OSError:
-            # Unwritable directory, path trouble: degrade to uncoordinated
-            # compute rather than failing the call over a diagnostic file.
-            return False
+            return None
         try:
-            os.write(descriptor, self._token)
-        finally:
-            os.close(descriptor)
+            try:
+                os.write(descriptor, self._token)
+            finally:
+                os.close(descriptor)
+        except OSError:
+            # ENOSPC on a full disk: the file exists but records no token,
+            # so release() could never prove ownership and the empty lock
+            # would strand as stale. Remove it best-effort and report the
+            # substrate failure instead of propagating into the user's call.
+            try:
+                self._path.unlink()
+            except OSError:
+                pass
+            return None
         self._held = True
         self._start_heartbeat()
         return True
@@ -183,9 +204,10 @@ def coordinate(
     ``fresh_value`` probes the store and returns the servable value or
     ``MISSING``. Returns ``(outcome, value, stale_broken)`` where outcome is
     ``"acquired"`` (this caller computes and must release the lock),
-    ``"served"`` (another process committed while we waited), or ``"timeout"``
+    ``"served"`` (another process committed while we waited), ``"timeout"``
     (the deadline passed: compute without coordination — the wait is the only
-    cost a wedged holder can ever impose).
+    cost a wedged holder can ever impose), or ``"unavailable"`` (no lock can
+    be created at all: compute without coordination, immediately).
     """
     deadline = monotonic() + max_wait
     interval = poll_initial
@@ -194,8 +216,16 @@ def coordinate(
         value = fresh_value()
         if value is not MISSING:
             return "served", value, stale_broken
-        if lock.try_acquire():
+        acquired = lock.try_acquire()
+        if acquired:
             return "acquired", None, stale_broken
+        if acquired is None:
+            # Structural failure: the create did not fail with EEXIST, so no
+            # holder exists, and none can arise while locks cannot be created
+            # — there is nothing to wait on. Consuming the deadline here would
+            # turn a broken lock substrate into a max_wait stall on every
+            # miss (#67); degrade to uncoordinated compute at once.
+            return "unavailable", None, stale_broken
         age = lock.age_seconds()
         if age is not None and age > stale_after and lock.break_stale(stale_after):
             # Only a real break earns the immediate retry. A failed break does

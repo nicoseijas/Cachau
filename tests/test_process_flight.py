@@ -371,6 +371,88 @@ def test_coordinate_is_bounded_when_a_stale_lock_cannot_be_broken():
     assert outcome == ("timeout", None, 0)
 
 
+# --------------------------------------------------------------------------- #
+# An unusable lock directory must not cost the wait at all (#67)
+# --------------------------------------------------------------------------- #
+
+
+class _BrokenSubstrateLock:
+    """A lock whose file can never be created: unwritable or missing lock
+    directory, full disk. No holder exists and no commit can arrive."""
+
+    def try_acquire(self):
+        return None
+
+    def age_seconds(self):
+        return None
+
+    def break_stale(self, stale_after):
+        return False
+
+
+def test_coordinate_computes_at_once_when_no_lock_can_be_created():
+    """#67: with nothing to wait on, consuming the deadline turns a broken
+    lock substrate into a max_wait stall on every miss."""
+    slept = []
+    outcome = coordinate(
+        _BrokenSubstrateLock(),
+        lambda: MISSING,
+        max_wait=60.0,
+        stale_after=5.0,
+        sleep=slept.append,
+    )
+    assert outcome == ("unavailable", None, 0)
+    assert slept == []  # not one poll interval was paid
+
+
+def test_try_acquire_reports_an_unusable_lock_directory(tmp_path):
+    lock = ProcessLock(tmp_path / "missing-dir" / "k.lock")
+    assert lock.try_acquire() is None
+
+
+def test_try_acquire_degrades_when_the_token_write_fails(tmp_path, monkeypatch):
+    """Full disk: O_CREAT can succeed and the token write still raise ENOSPC.
+    The empty lock must not strand — release() could never prove ownership of
+    a file without its token — and the failure must not reach the caller."""
+
+    def refuse_write(descriptor, data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("cachau.interprocess.os.write", refuse_write)
+    lock = ProcessLock(tmp_path / "k.lock")
+    assert lock.try_acquire() is None
+    assert not (tmp_path / "k.lock").exists()
+
+
+def test_unusable_lock_directory_computes_immediately(tmp_path, monkeypatch):
+    """End to end: every miss must pay the compute, never the coalesce wait."""
+    monkeypatch.setattr("cachau.decorator._PROCESS_WAIT_DEFAULT", 20.0)
+    real_open = os.open
+
+    def refuse_lock_creates(path, flags, *args, **kwargs):
+        if str(path).endswith(".lock"):
+            raise PermissionError(13, "lock directory is not writable")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr("cachau.interprocess.os.open", refuse_lock_creates)
+    calls = []
+
+    @cache(persist=str(tmp_path), coalesce="processes")
+    def f(x):
+        calls.append(x)
+        return x * 2
+
+    started = time.perf_counter()
+    assert f(1) == 2
+    waited = time.perf_counter() - started
+    assert calls == [1]
+    assert waited < 5.0  # a broken substrate is a compute, not a 20s stall
+    assert f(1) == 2  # the commit itself worked: a plain HIT afterwards
+    stats = f.cache.stats()
+    assert stats.process_lock_errors == 1  # its own story, not a "timeout"
+    assert stats.process_flight_timeouts == 0
+
+
 def test_undeletable_stale_lock_degrades_to_computing(tmp_path, monkeypatch):
     """End to end: the caller returns on its own deadline and computes."""
     monkeypatch.setattr("cachau.decorator._PROCESS_WAIT_DEFAULT", 0.2)
