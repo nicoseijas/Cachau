@@ -352,6 +352,10 @@ class CacheControl:
         # the min estimator has a clean floor to find.
         cheap_repeats = max(repeats, 20)
         key_seconds = measure(lambda: self._key_builder(*args, **kwargs), cheap_repeats)
+        try:
+            size_bytes: int | None = int(self._size_of(value))
+        except Exception:  # noqa: BLE001 - size is informational, never fatal
+            size_bytes = None
         existed = self._backend.get(key) is not None
         wrote_throwaway = False
         if not existed:
@@ -360,13 +364,23 @@ class CacheControl:
             # must not leak out of a diagnostic call (#53). Degraded, the read
             # measurement below times a miss lookup — cheaper than a real HIT,
             # which can only understate the cache's cost, never oversell it.
+            # Stamped like a real commit: the cleanup delete below is best
+            # effort, so a survivor must be a correct entry — expiring with
+            # the TTL, sized for budget rehydration — never immortal (#71).
+            created_at = self._now()
             try:
                 self._backend.set(
                     key,
                     CacheEntry(
                         value=value,
                         namespace=self.namespace,
-                        created_at=self._now(),
+                        created_at=created_at,
+                        expires_at=(
+                            created_at + self.ttl_seconds
+                            if self.ttl_seconds is not None
+                            else None
+                        ),
+                        size=size_bytes,
                         dependency_fingerprints=fingerprint_dependencies(
                             self._dependencies
                         ),
@@ -383,10 +397,6 @@ class CacheControl:
                     self._backend.delete(key)
                 except Exception:  # noqa: BLE001 - measurement cleanup, best effort
                     pass
-        try:
-            size_bytes: int | None = int(self._size_of(value))
-        except Exception:  # noqa: BLE001 - size is informational, never fatal
-            size_bytes = None
         largest = largest_data_arg(normalize_call(self._func, args, kwargs))
         declared_code = {
             function_namespace(item.dependency.func)
