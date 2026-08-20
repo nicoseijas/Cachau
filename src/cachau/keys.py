@@ -200,20 +200,35 @@ def _feed_data_object(hasher: Any, value: Any) -> bool:
                 b"dataframe-dtypes",
                 repr([str(dtype) for dtype in value.dtypes]).encode(),
             )
-            row_hashes = pd.util.hash_pandas_object(value, index=True)
+            try:
+                row_hashes = pd.util.hash_pandas_object(value, index=True)
+            except Exception as exc:  # noqa: BLE001 - unhashable cell: fail loudly
+                raise UnhashableArgumentError(
+                    f"pandas DataFrame could not be hashed: {exc}"
+                ) from None
             _emit(hasher, b"dataframe-data", row_hashes.to_numpy().tobytes())
             return True
         if isinstance(value, pd.Series):
             _emit_concrete_type(hasher, value, pd.Series)
             _emit(hasher, b"series-name", repr(value.name).encode())
             _emit(hasher, b"series-dtype", str(value.dtype).encode())
-            row_hashes = pd.util.hash_pandas_object(value, index=True)
+            try:
+                row_hashes = pd.util.hash_pandas_object(value, index=True)
+            except Exception as exc:  # noqa: BLE001 - unhashable cell: fail loudly
+                raise UnhashableArgumentError(
+                    f"pandas Series could not be hashed: {exc}"
+                ) from None
             _emit(hasher, b"series-data", row_hashes.to_numpy().tobytes())
             return True
         if isinstance(value, pd.Index):
             _emit_concrete_type(hasher, value, pd.Index)
             _emit(hasher, b"index-dtype", str(value.dtype).encode())
-            row_hashes = pd.util.hash_pandas_object(value)
+            try:
+                row_hashes = pd.util.hash_pandas_object(value)
+            except Exception as exc:  # noqa: BLE001 - unhashable cell: fail loudly
+                raise UnhashableArgumentError(
+                    f"pandas Index could not be hashed: {exc}"
+                ) from None
             _emit(hasher, b"index-data", row_hashes.to_numpy().tobytes())
             return True
     return False

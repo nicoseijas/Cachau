@@ -6,6 +6,7 @@ np = pytest.importorskip("numpy")
 pd = pytest.importorskip("pandas")
 
 from cachau import cache
+from cachau.errors import UnhashableArgumentError
 from cachau.keys import digest_arguments
 
 
@@ -135,3 +136,30 @@ def test_object_dtype_dataframe_content_is_hashed():
     left = pd.DataFrame({"s": ["abc", "def"]})
     right = pd.DataFrame({"s": ["abc", "xyz"]})
     assert digest(left) != digest(right)
+
+
+def test_unhashable_dataframe_cell_raises_the_documented_error():
+    with pytest.raises(UnhashableArgumentError, match="pandas DataFrame"):
+        digest(pd.DataFrame({"a": [{"x": 1}]}))
+
+
+def test_unhashable_series_cell_raises_the_documented_error():
+    with pytest.raises(UnhashableArgumentError, match="pandas Series"):
+        digest(pd.Series([{"x": 1}]))
+
+
+def test_unhashable_index_cell_raises_the_documented_error():
+    with pytest.raises(UnhashableArgumentError, match="pandas Index"):
+        digest(pd.Index([{"x": 1}], dtype=object))
+
+
+def test_unhashable_frame_as_closure_capture_does_not_break_decoration():
+    """The fingerprint tolerates unhashable captures by falling back to opaque
+    identity — but only if the pandas branch raises UnhashableArgumentError."""
+    frame = pd.DataFrame({"a": [{"x": 1}]})
+
+    @cache
+    def g(n):
+        return len(frame) + n
+
+    assert g(1) == 2
